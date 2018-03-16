@@ -1,0 +1,18 @@
+#!/bin/csh
+
+# build vc, and its test utility fifo2file.  
+#
+# build should generate no warning or error messages.
+
+echo -n "building vc ... "
+rm -f a.out vc
+cc -g vc.c
+mv a.out vc 
+echo "Done."
+
+echo -n "building fifo2file ... "
+rm -f a.out fifo2file
+cc -g fifo2file.c
+mv a.out fifo2file
+echo "Done."
+
