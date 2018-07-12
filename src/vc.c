@@ -15,9 +15,8 @@
 #define FALSE 0
 #define TRUE  1
 #define MAX_PATH_LEN		1024
-#define MAX_SEQUENCE_LEN	10240
-#define MIN_CHARS_PER_SEQ	100
-#define LINES_PER_SEQ		4
+//#define MAX_SEQUENCE_LEN	10240
+#define MAX_SEQUENCE_LEN	(1024*1024 * 16)
 #define IO_BUF_SIZE		((size_t)(1024 * 10246))
 
 /* Sequence line possible ID flags */
@@ -42,8 +41,8 @@
  */
 typedef enum name_pattern_kind {
    np_none,
-   np_neat,	// patterns identical up to a slash "/"
-   np_illumina	// patterns identical up to a space " "
+   np_neat,	// neat
+   np_illumina	// illumina
 } name_pattern_kind;
 
 
@@ -56,7 +55,6 @@ struct vc_vars
    unsigned long long chunk_len;
    unsigned long long chunk_index;
    unsigned long long max_chunk_index;
-   double input_match_ratio;
    name_pattern_kind name_pattern;
    int verbosity;	/* verbosity == 0 ==> output on error only */
                         /* verbosity == 1 ==> terse functional output */
@@ -134,7 +132,7 @@ struct dry_run_chunk_record
 
 /* function declarations */
 
-static void close_input_files(struct vc_vars * vars_ptr);
+static void close_input_file(struct vc_vars * vars_ptr);
 static int compute_actual_chunk_end_point(struct vc_vars * vars_ptr);
 static int compute_actual_chunk_start_point(struct vc_vars * vars_ptr);
 static int compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr);
@@ -149,7 +147,7 @@ static void dump_params(struct vc_vars * vars_ptr);
 static void dump_line_map(struct line_header line_map[], int line_count);
 static void dump_seq_map(struct seq_header map[], int seq_count);
 static int get_params(int argc, char *argv[], struct vc_vars * vars_ptr);
-static int open_input_files(struct vc_vars * vars_ptr);
+static int open_input_file(struct vc_vars * vars_ptr);
 static int load_buf_from_file(int fd, off_t offset, off_t buf_len,
                               char *buf_ptr, struct vc_vars * vars_ptr);
 static int map_test_buf(off_t test_buf_offset, char test_buf[],
@@ -169,7 +167,7 @@ static int merge_chunks(struct vc_vars * vars_ptr);
 
 
 /*-------------------------------------------------------------------------
- * Function:    close_input_files()
+ * Function:    close_input_file()
  *
  * Purpose:     Attempt to close the input file.  Generate an error
  *		error message on failure.
@@ -183,7 +181,7 @@ static int merge_chunks(struct vc_vars * vars_ptr);
  *-------------------------------------------------------------------------
  */
 static void
-close_input_files(struct vc_vars * vars_ptr)
+close_input_file(struct vc_vars * vars_ptr)
 {
    int result;
    int saved_errno;
@@ -208,27 +206,9 @@ close_input_files(struct vc_vars * vars_ptr)
       vars_ptr->input_fd = -1;
    }
 
-   if ( vars_ptr->aux_input_fd == -1 ) return;
-
-   errno = 0;
-   result = close(vars_ptr->aux_input_fd);
-   saved_errno = errno;
-
-   if ( result == -1 )
-   {
-      fprintf(stderr, "\nERROR: Can't close aux input file \"%s\".\n",
-              vars_ptr->aux_input_file_name);
-      fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
-              strerror(saved_errno));
-   }
-   else
-   {
-      vars_ptr->aux_input_fd = -1;
-   }
-
    return;
 
-} /* close_input_files() */
+} /* close_input_file() */
 
 
 /*-------------------------------------------------------------------------
@@ -272,11 +252,10 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
    int seq_count;
    off_t test_buf_start;
    off_t test_buf_len;
-   struct seq_header seq_map[4 * MAX_SEQUENCE_LEN / MIN_CHARS_PER_SEQ];
-   off_t seq_map_len = 4 * MAX_SEQUENCE_LEN / MIN_CHARS_PER_SEQ;
+   struct seq_header map[MAX_SEQUENCE_LEN / 4];
 
    test_buf_start = vars_ptr->nominal_chunk_end;
-   assert(test_buf_start > (off_t)(2 * MAX_SEQUENCE_LEN));
+   assert(test_buf_start > (off_t)(MAX_SEQUENCE_LEN *2));
    test_buf_start -= (off_t)(2 * MAX_SEQUENCE_LEN);
    assert(test_buf_start < vars_ptr->input_file_len);
    test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
@@ -286,15 +265,15 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
      test_buf, vars_ptr) )
       return FALSE;
 
-   if ( ! map_test_buf(test_buf_start, test_buf, test_buf_len, seq_map,
-     seq_map_len, &seq_count, vars_ptr) )
+   if ( ! map_test_buf(test_buf_start, test_buf, test_buf_len, map,
+     MAX_SEQUENCE_LEN / 4, &seq_count, vars_ptr) )
       return FALSE;
 
-   assert(seq_count < seq_map_len);
+   assert(seq_count < (MAX_SEQUENCE_LEN / 4));
 
    int i = 0;
    for (i = 0; ( i < seq_count ) &&
-     (seq_map[i].offsets[0] <= vars_ptr->nominal_chunk_end); i++);
+     (map[i].offsets[0] <= vars_ptr->nominal_chunk_end); i++);
 
    i--; /* to get back to the last sequence that starts before
          * the nominal end of chunk.
@@ -304,8 +283,8 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
    assert(i > 0);
 
    /* make sure we got the dividing line correct */
-   assert( seq_map[i].offsets[0] <= vars_ptr->nominal_chunk_end );
-   assert( seq_map[i+1].offsets[0] > vars_ptr->nominal_chunk_end );
+   assert( map[i].offsets[0] <= vars_ptr->nominal_chunk_end );
+   assert( map[i+1].offsets[0] > vars_ptr->nominal_chunk_end );
 
    if ( i >= seq_count )
    {
@@ -313,16 +292,16 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
 
       if ( vars_ptr->verbosity >= 3 )
       {
-         dump_seq_map(seq_map, seq_count);
+         dump_seq_map(map, seq_count);
       }
       return FALSE;
    }
 
    assert(i + 1 < seq_count);
 
-   assert(seq_map[i+1].offsets[0] - 1 >=
+   assert(map[i+1].offsets[0] - 1 >=
           vars_ptr->nominal_chunk_end);
-   assert(seq_map[i+1].offsets[0] - 1 <
+   assert(map[i+1].offsets[0] - 1 <
           (vars_ptr->nominal_chunk_end +
            (off_t)(2 * MAX_SEQUENCE_LEN)));
 
@@ -338,12 +317,12 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
        * which match the pattern, and they are contiguous in the
        * input.
        */
-      if ( name_match(seq_map[i].lines[0], seq_map[i + 1].lines[0], vars_ptr) )
+      if ( name_match(map[i].lines[0], map[i + 1].lines[0], vars_ptr) )
       {
          if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
          {
              fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
-             fprintf(stdout, "\"%s\"\n\"%s\"\n", seq_map[i].lines[0], seq_map[i + 1].lines[0]);
+             fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i].lines[0], map[i + 1].lines[0]);
              fprintf(stdout, "Split at previous chunk instead.\n");
          }
 
@@ -353,8 +332,13 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
 
 
    /* we found our actual end point */
-   vars_ptr->actual_chunk_end = seq_map[i+1].offsets[0] - 1;
-   char *in_name = seq_map[i].lines[0];
+   vars_ptr->actual_chunk_end = map[i+1].offsets[0] - 1;
+   char *in_name = map[i].lines[0];
+
+//fprintf(stderr, "i = %d\n", i);
+//fprintf(stderr, "in_name = %s\n", in_name);
+//fprintf(stderr, "nominal_chunk_end = 0x%llx\n", vars_ptr->nominal_chunk_end);
+//fprintf(stderr, "actual_chunk_end = 0x%llx\n", vars_ptr->actual_chunk_end);
 
    if ( ( vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
    {
@@ -364,8 +348,8 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
 
       for ( j = 0; j < 4; j++ )
       {
-         vars_ptr->last_lines[j] = strdup(seq_map[i].lines[j]);
-         vars_ptr->last_lines_offsets[j] = seq_map[i].offsets[j];
+         vars_ptr->last_lines[j] = strdup(map[i].lines[j]);
+         vars_ptr->last_lines_offsets[j] = map[i].offsets[j];
       }
    }
    else if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 1 ) )
@@ -376,10 +360,10 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
                  "==========================================\n");
          fprintf(stdout,
                  "Sequence before actual chunk end offset = %llu\n",
-                 (unsigned long long)(seq_map[i].offsets[0]));
+                 (unsigned long long)(map[i].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i].lines[0], seq_map[i].lines[1],
-                 seq_map[i].lines[2], seq_map[i].lines[3]);
+                 map[i].lines[0], map[i].lines[1],
+                 map[i].lines[2], map[i].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
@@ -393,10 +377,10 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
                  "==========================================\n");
          fprintf(stdout,
                  "Sequence after actual chunk end offset = %llu\n",
-                 (unsigned long long)(seq_map[i + 1].offsets[0]));
+                 (unsigned long long)(map[i + 1].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i + 1].lines[0], seq_map[i + 1].lines[1],
-                 seq_map[i + 1].lines[2], seq_map[i + 1].lines[3]);
+                 map[i + 1].lines[0], map[i + 1].lines[1],
+                 map[i + 1].lines[2], map[i + 1].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
@@ -408,69 +392,37 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
    //
    // Search for a read with the same id in the aux input file.
    //
-   // The size of the read is determinted by input_name_match,
-   // which should be set to indicate the max difference in offsets
-   // in the two inputs files that a given sequence pair resides.
-   //
-   if ( vars_ptr->aux_input_fd < 0 )
-   {
-      assert(test_buf_len == (off_t)(4 * MAX_SEQUENCE_LEN));
-      assert(seq_map_len == 4 * MAX_SEQUENCE_LEN / MIN_CHARS_PER_SEQ);
-   }
-   else
-   {
-      test_buf_len = vars_ptr->input_match_ratio * vars_ptr->aux_input_file_len;
-fprintf(stderr, "\nHEREe0 input_match_ratio = %lf test_buf_len = %lld\n", vars_ptr->input_match_ratio, test_buf_len);
-      if ( test_buf_len < 4 * MAX_SEQUENCE_LEN )
-         test_buf_len = 4 * MAX_SEQUENCE_LEN;
-      seq_map_len = test_buf_len / MAX_SEQUENCE_LEN;
-   }
-   char *aux_test_buf = malloc(test_buf_len * sizeof(char));
-   struct seq_header *aux_seq_map
-     = malloc(seq_map_len * sizeof(struct seq_header));
-   assert(aux_test_buf != NULL);
-   assert(aux_seq_map != NULL);
-
-fprintf(stderr, "\nHEREe1 input_match_ratio = %lf test_buf_len = %lld seq_map_len = %lld\n", vars_ptr->input_match_ratio, test_buf_len, seq_map_len);
+   char aux_test_buf[4 * MAX_SEQUENCE_LEN];
 
    //
    // Scale the start point to search for the matching sequence by the
-   // ratio of the input file sizes.
+   // ration of the input file sizes.
    //
    test_buf_start = (((double)vars_ptr->aux_input_file_len) /
      vars_ptr->input_file_len) * vars_ptr->nominal_chunk_end;
-   assert(test_buf_start > test_buf_len / 2);
-   test_buf_start -= test_buf_len / 2;
+   assert(test_buf_start > (off_t)(MAX_SEQUENCE_LEN *2));
+   test_buf_start -= (off_t)(2 * MAX_SEQUENCE_LEN);
    if (test_buf_start >= vars_ptr->aux_input_file_len) {
       fprintf(stderr, "\nERROR: Can't find matching end sequence id in aux input.\n\n");
 
       if ( vars_ptr->verbosity >= 3 )
-         dump_seq_map(seq_map, seq_count);
-      free(aux_seq_map);
-      free(aux_test_buf);
+         dump_seq_map(map, seq_count);
       return FALSE;
    }
+   test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
    assert(test_buf_start + test_buf_len < vars_ptr->aux_input_file_len);
 
    if ( ! load_buf_from_file(vars_ptr->aux_input_fd, test_buf_start,
      test_buf_len, aux_test_buf, vars_ptr) )
-   {
-      free(aux_seq_map);
-      free(aux_test_buf);
       return FALSE;
-   }
 
-   if ( ! map_test_buf(test_buf_start, aux_test_buf, test_buf_len, seq_map,
-     seq_map_len, &seq_count, vars_ptr) )
-   {
-      free(aux_seq_map);
-      free(aux_test_buf);
+   if ( ! map_test_buf(test_buf_start, aux_test_buf, test_buf_len, map,
+     MAX_SEQUENCE_LEN / 4, &seq_count, vars_ptr) )
       return FALSE;
-   }
 
-   assert(seq_count < seq_map_len);
+   assert(seq_count < (MAX_SEQUENCE_LEN / 4));
 
-   for (i = 0; ( i < seq_count ) && (! name_match(seq_map[i].lines[0], in_name,
+   for (i = 0; ( i < seq_count ) && (! name_match(map[i].lines[0], in_name,
      vars_ptr)); i++);
 
    if ( i >= seq_count-1 )
@@ -478,24 +430,20 @@ fprintf(stderr, "\nHEREe1 input_match_ratio = %lf test_buf_len = %lld seq_map_le
       fprintf(stderr, "\nERROR: Can't find matching end sequence id in aux input.\n\n");
 
       if ( vars_ptr->verbosity >= 3 )
-         dump_seq_map(seq_map, seq_count);
-      free(aux_seq_map);
-      free(aux_test_buf);
+         dump_seq_map(map, seq_count);
       return FALSE;
    }
 
-   /* We found the matching start point in the aux input file. */
-   vars_ptr->aux_chunk_end = seq_map[i+1].offsets[0] - 1;
-
-fprintf(stderr, "\nHEREe2 i = %d seq_count = %d aux_chunk_end = %lld.\n", i, seq_count, vars_ptr->aux_chunk_end);
+   /* we found the matching end point in the aux file */
+   vars_ptr->aux_chunk_end = map[i+1].offsets[0] - 1;
 
    if ( ( vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
    {
       int j;
       for ( j = 0; j < 4; j++ )
       {
-         vars_ptr->aux_last_lines[j] = strdup(seq_map[i].lines[j]);
-         vars_ptr->aux_last_lines_offsets[j] = seq_map[i].offsets[j];
+         vars_ptr->aux_last_lines[j] = strdup(map[i].lines[j]);
+         vars_ptr->aux_last_lines_offsets[j] = map[i].offsets[j];
       }
    }
    else if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 1 ) )
@@ -506,10 +454,10 @@ fprintf(stderr, "\nHEREe2 i = %d seq_count = %d aux_chunk_end = %lld.\n", i, seq
                  "==========================================\n");
          fprintf(stdout,
                  "Aux sequence before chunk end offset = %llu\n",
-                 (unsigned long long)(seq_map[i].offsets[0]));
+                 (unsigned long long)(map[i].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i].lines[0], seq_map[i].lines[1],
-                 seq_map[i].lines[2], seq_map[i].lines[3]);
+                 map[i].lines[0], map[i].lines[1],
+                 map[i].lines[2], map[i].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
@@ -523,17 +471,15 @@ fprintf(stderr, "\nHEREe2 i = %d seq_count = %d aux_chunk_end = %lld.\n", i, seq
                  "==========================================\n");
          fprintf(stdout,
                  "Aux sequence after chunk end offset = %llu\n",
-                 (unsigned long long)(seq_map[i + 1].offsets[0]));
+                 (unsigned long long)(map[i + 1].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i + 1].lines[0], seq_map[i + 1].lines[1],
-                 seq_map[i + 1].lines[2], seq_map[i + 1].lines[3]);
+                 map[i + 1].lines[0], map[i + 1].lines[1],
+                 map[i + 1].lines[2], map[i + 1].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
    }
 
-   free(aux_seq_map);
-   free(aux_test_buf);
    return TRUE;
 
 } /* compute_actual_chunk_end_point() */
@@ -580,11 +526,10 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
    int seq_count;
    off_t test_buf_start;
    off_t test_buf_len;
-   struct seq_header seq_map[4 * MAX_SEQUENCE_LEN / MIN_CHARS_PER_SEQ];
-   off_t seq_map_len = 4 * MAX_SEQUENCE_LEN / MIN_CHARS_PER_SEQ;
+   struct seq_header map[MAX_SEQUENCE_LEN / 4];
 
    test_buf_start = vars_ptr->nominal_chunk_start;
-   assert(test_buf_start > (off_t)(2 * MAX_SEQUENCE_LEN));
+   assert(test_buf_start > (off_t)(MAX_SEQUENCE_LEN *2));
    test_buf_start -= (off_t)(2 * MAX_SEQUENCE_LEN);
    assert(test_buf_start < vars_ptr->input_file_len);
    test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
@@ -594,22 +539,22 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
      test_buf, vars_ptr) )
       return FALSE;
 
-   if (! map_test_buf(test_buf_start, test_buf, test_buf_len, seq_map,
-     seq_map_len, &seq_count, vars_ptr) )
+   if (! map_test_buf(test_buf_start, test_buf, test_buf_len, map,
+     MAX_SEQUENCE_LEN / 4, &seq_count, vars_ptr) )
       return FALSE;
 
-   assert(seq_count < seq_map_len);
+   assert(seq_count < (MAX_SEQUENCE_LEN / 4));
 
    int i = 0;
    for (i = 0; ( i < seq_count ) &&
-     (seq_map[i].offsets[0] < vars_ptr->nominal_chunk_start); i++);
+     (map[i].offsets[0] < vars_ptr->nominal_chunk_start); i++);
 
    /* if this assert fails, MAX_SEQUENCE_LEN is probably too small */
    assert(i > 0);
 
    /* make sure we got the dividing line correct */
-   assert( seq_map[i].offsets[0] >= vars_ptr->nominal_chunk_start );
-   assert( seq_map[i-1].offsets[0] < vars_ptr->nominal_chunk_start );
+   assert( map[i].offsets[0] >= vars_ptr->nominal_chunk_start );
+   assert( map[i-1].offsets[0] < vars_ptr->nominal_chunk_start );
 
    if ( i >= seq_count )
    {
@@ -617,15 +562,15 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
 
       if ( vars_ptr->verbosity >= 3 )
       {
-         dump_seq_map(seq_map, seq_count);
+         dump_seq_map(map, seq_count);
       }
 
       return FALSE;
    }
 
-   assert(seq_map[i].offsets[0] >=
+   assert(map[i].offsets[0] >=
           vars_ptr->nominal_chunk_start);
-   assert(seq_map[i].offsets[0] <
+   assert(map[i].offsets[0] <
           (vars_ptr->nominal_chunk_start +
            (off_t)(2 * MAX_SEQUENCE_LEN)));
 
@@ -641,12 +586,12 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
        * which match the pattern, and they are contiguous in the
        * input.
        */
-      if ( name_match(seq_map[i - 1].lines[0], seq_map[i].lines[0], vars_ptr) )
+      if ( name_match(map[i - 1].lines[0], map[i].lines[0], vars_ptr) )
       {
          if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
          {
              fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
-             fprintf(stdout, "\"%s\"\n\"%s\"\n", seq_map[i - 1].lines[0], seq_map[i].lines[0]);
+             fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i - 1].lines[0], map[i].lines[0]);
              fprintf(stdout, "Split at previous chunk instead.\n");
          }
 
@@ -655,8 +600,8 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
    }
 
    /* we found our actual start point */
-   vars_ptr->actual_chunk_start = seq_map[i].offsets[0];
-   char *in_name = seq_map[i-1].lines[0];
+   vars_ptr->actual_chunk_start = map[i].offsets[0];
+   char *in_name = map[i].lines[0];
 
    if ( ( vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
    {
@@ -666,8 +611,8 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
 
       for ( j = 0; j < 4; j++ )
       {
-         vars_ptr->first_lines[j] = strdup(seq_map[i].lines[j]);
-         vars_ptr->first_lines_offsets[j] = seq_map[i].offsets[j];
+         vars_ptr->first_lines[j] = strdup(map[i].lines[j]);
+         vars_ptr->first_lines_offsets[j] = map[i].offsets[j];
       }
    }
    else if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 1 ) )
@@ -678,10 +623,10 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
                  "==========================================\n");
          fprintf(stdout,
                  "Sequence before actual chunk start offset = %llu\n",
-                  (unsigned long long)(seq_map[i - 1].offsets[0]));
+                  (unsigned long long)(map[i - 1].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i - 1].lines[0], seq_map[i - 1].lines[1],
-                 seq_map[i - 1].lines[2], seq_map[i - 1].lines[3]);
+                 map[i - 1].lines[0], map[i - 1].lines[1],
+                 map[i - 1].lines[2], map[i - 1].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
@@ -695,10 +640,10 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
                  "==========================================\n");
          fprintf(stdout,
                  "Sequence after actual chunk start offset = %llu\n",
-                 (unsigned long long)(seq_map[i].offsets[0]));
+                 (unsigned long long)(map[i].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i].lines[0], seq_map[i].lines[1],
-                 seq_map[i].lines[2], seq_map[i].lines[3]);
+                 map[i].lines[0], map[i].lines[1],
+                 map[i].lines[2], map[i].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
@@ -710,59 +655,31 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
    //
    // Search for a read with the same id in the aux input file.
    //
-   // The size of the read is determinted by input_name_match,
-   // which should be set to indicate the max difference in offsets
-   // in the two inputs files that a given sequence pair resides.
-   //
-   if ( vars_ptr->aux_input_fd < 0 )
-   {
-      assert(test_buf_len == (off_t)(4 * MAX_SEQUENCE_LEN));
-      assert(seq_map_len == 4 * MAX_SEQUENCE_LEN / MIN_CHARS_PER_SEQ);
-   }
-   else
-   {
-      test_buf_len = vars_ptr->input_match_ratio * vars_ptr->aux_input_file_len;
-      if ( test_buf_len < 4 * MAX_SEQUENCE_LEN )
-         test_buf_len = 4 * MAX_SEQUENCE_LEN;
-      seq_map_len = test_buf_len / MAX_SEQUENCE_LEN;
-   }
-   char *aux_test_buf = malloc(test_buf_len * sizeof(char));
-      struct seq_header *aux_seq_map
-     = malloc(seq_map_len * sizeof(struct seq_header));
-   assert(aux_test_buf != NULL);
-   assert(aux_seq_map != NULL);
-
-fprintf(stderr, "\nHEREs1 input_match_ratio = %lf test_buf_len = %lld seq_map_len = %lld", vars_ptr->input_match_ratio, test_buf_len, seq_map_len);
+   char aux_test_buf[4 * MAX_SEQUENCE_LEN];
 
    //
    // Scale the start point to search for the matching sequence by the
-   // ratio of the input file sizes.
+   // ration of the input file sizes.
    //
    test_buf_start = (((double)vars_ptr->aux_input_file_len) /
      vars_ptr->input_file_len) * vars_ptr->nominal_chunk_start;
-   assert(test_buf_start > test_buf_len / 2);
-   test_buf_start -= test_buf_len / 2;
-   assert(test_buf_start + test_buf_len < vars_ptr->aux_input_file_len);
+   assert(test_buf_start > (off_t)(MAX_SEQUENCE_LEN *2));
+   test_buf_start -= (off_t)(2 * MAX_SEQUENCE_LEN);
+   assert(test_buf_start < vars_ptr->input_file_len);
+   test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
+   assert(test_buf_start + test_buf_len < vars_ptr->input_file_len);
 
    if (! load_buf_from_file(vars_ptr->aux_input_fd, test_buf_start,
      test_buf_len, aux_test_buf, vars_ptr) )
-   {
-      free(aux_seq_map);
-      free(aux_test_buf);
       return FALSE;
-   }
 
-   if (! map_test_buf(test_buf_start, aux_test_buf, test_buf_len, seq_map,
-     seq_map_len, &seq_count, vars_ptr) )
-   {
-      free(aux_seq_map);
-      free(aux_test_buf);
+   if (! map_test_buf(test_buf_start, aux_test_buf, test_buf_len, map,
+     MAX_SEQUENCE_LEN / 4, &seq_count, vars_ptr) )
       return FALSE;
-   }
 
-   assert(seq_count < seq_map_len);
+   assert(seq_count < (MAX_SEQUENCE_LEN / 4));
 
-   for (i = 0; ( i < seq_count ) && (! name_match(seq_map[i].lines[0], in_name,
+   for (i = 0; ( i < seq_count ) && (! name_match(map[i].lines[0], in_name,
      vars_ptr)); i++);
 
    if ( i >= seq_count-1 )
@@ -771,18 +688,14 @@ fprintf(stderr, "\nHEREs1 input_match_ratio = %lf test_buf_len = %lld seq_map_le
 
       if ( vars_ptr->verbosity >= 3 )
       {
-         dump_seq_map(seq_map, seq_count);
+         dump_seq_map(map, seq_count);
       }
 
-      free(aux_seq_map);
-      free(aux_test_buf);
       return FALSE;
    }
 
-   /* We found the matching start point in the aux input file. */
-   vars_ptr->aux_chunk_start = seq_map[i].offsets[0];
-
-fprintf(stderr, "\nHEREs2 i = %d aux_chunk_start = %lld.\n", i, vars_ptr->aux_chunk_start);
+   /* we found the matching start point in the aux input file */
+   vars_ptr->aux_chunk_start = map[i].offsets[0];
 
    if ( ( vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
    {
@@ -792,8 +705,8 @@ fprintf(stderr, "\nHEREs2 i = %d aux_chunk_start = %lld.\n", i, vars_ptr->aux_ch
 
       for ( j = 0; j < 4; j++ )
       {
-         vars_ptr->aux_first_lines[j] = strdup(seq_map[i].lines[j]);
-         vars_ptr->aux_first_lines_offsets[j] = seq_map[i].offsets[j];
+         vars_ptr->aux_first_lines[j] = strdup(map[i].lines[j]);
+         vars_ptr->aux_first_lines_offsets[j] = map[i].offsets[j];
       }
    }
    else if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 1 ) )
@@ -804,16 +717,16 @@ fprintf(stderr, "\nHEREs2 i = %d aux_chunk_start = %lld.\n", i, vars_ptr->aux_ch
                  "==========================================\n");
          fprintf(stdout,
                  "Aux sequence before actual chunk start offset = %llu\n",
-                  (unsigned long long)(seq_map[i - 1].offsets[0]));
+                  (unsigned long long)(map[i - 1].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i - 1].lines[0], seq_map[i - 1].lines[1],
-                 seq_map[i - 1].lines[2], seq_map[i - 1].lines[3]);
+                 map[i - 1].lines[0], map[i - 1].lines[1],
+                 map[i - 1].lines[2], map[i - 1].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
 
       fprintf(stdout, "Aux chunk start offset = %llu.\n",
-              (unsigned long long)(vars_ptr->aux_chunk_start));
+              (unsigned long long)(vars_ptr->actual_chunk_start));
 
       if ( vars_ptr->verbosity >= 2 )
       {
@@ -821,17 +734,15 @@ fprintf(stderr, "\nHEREs2 i = %d aux_chunk_start = %lld.\n", i, vars_ptr->aux_ch
                  "==========================================\n");
          fprintf(stdout,
                  "Aux sequence after actual chunk start offset = %llu\n",
-                 (unsigned long long)(seq_map[i].offsets[0]));
+                 (unsigned long long)(map[i].offsets[0]));
          fprintf(stdout, "%s\n%s\n%s\n%s\n",
-                 seq_map[i].lines[0], seq_map[i].lines[1],
-                 seq_map[i].lines[2], seq_map[i].lines[3]);
+                 map[i].lines[0], map[i].lines[1],
+                 map[i].lines[2], map[i].lines[3]);
          fprintf(stdout,
                  "==========================================\n");
       }
    }
 
-   free(aux_seq_map);
-   free(aux_test_buf);
    return TRUE;
 } /* compute_actual_chunk_start_point() */
 
@@ -945,7 +856,7 @@ compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr)
  *		line.  Assuming the given offset for the first "@" line
  *		in the line map, count the number of contradictions between
  *		the assumed offset and the id flags set for each line.
- *
+ *		
  *		Return this value in *err_count_ptr.
  *
  * Return:      TRUE if successful, and FALSE otherwise.
@@ -1057,9 +968,6 @@ static int name_match(char *name1, char *name2, struct vc_vars * vars_ptr)
       /*
        * Return TRUE if the names match up to the space character.
        */
-
-if (strncmp(name1, name2, 27)) fprintf(stderr, "HERR\nname1 = %s\nname2 = %s\n\n", name1, name2);
-
       char *cp = strchr(name1, ' ');
       int len = (cp != NULL) ?  (cp - name1) : strlen(name1);
       if (( strncmp(name1, name2, len) == 0)
@@ -1447,7 +1355,7 @@ get_params(int argc,
 
    assert(vars_ptr != NULL);
 
-   while ( (opt = getopt(argc, argv, "ds:i:m:n:r:f:p:v?")) != -1 )
+   while ( (opt = getopt(argc, argv, "ds:i:m:n:f:p:v?")) != -1 )
    {
       switch ( opt )
       {
@@ -1562,27 +1470,18 @@ get_params(int argc,
          case 'n':
             assert(optarg != NULL);
             if ( (strcmp(optarg, "neat") == 0 )
-              || (strcmp(optarg, "/") == 0) )
-               vars_ptr->name_pattern = np_neat;
+              || (strcmp(optarg, "/") == 0) ) {
+                vars_ptr->name_pattern = np_neat;
+            }
             else if ( (strcmp(optarg, "illumina") == 0 )
-              || (strcmp(optarg, " ") == 0) )
+              || (strcmp(optarg, " ") == 0) ) {
                 vars_ptr->name_pattern = np_illumina;
-            else
-            {
+            }
+            else {
                fprintf(stderr, "\nSYNTAX ERROR: Unknown name pattern / vendor name\n\n");
                return FALSE;
             }
             errno = 0;
-            break;
-
-         case 'r':
-            assert(optarg != NULL);
-            if ( (sscanf(optarg, "%lf", &(vars_ptr->input_match_ratio)) != 1)
-              || (vars_ptr->input_match_ratio <= 0.0) )
-            {
-               fprintf(stderr, "\nSYNTAX ERROR: input match ratio must be positive floating point number\n\n");
-               return FALSE;
-            }
             break;
 
          case 'f':
@@ -1693,13 +1592,11 @@ get_params(int argc,
 
 /*-------------------------------------------------------------------------
  *
- * Function:    open_input_files()
+ * Function:    open_input_file()
  *
  * Purpose:     Stat the input file, load its size (in bytes) and run some
  *              checks, and calculate the number of chunks or the chunk
- *              size if only one or the other was specified.  Then open the
- *              input file.  Also open the aux input file if the name was
- *              specified, and run some checks on its length.
+ *              size if only one was specified.  Then open the input file.
  *
  * Return:      Success: TRUE
  *              Failure: FALSE
@@ -1707,7 +1604,7 @@ get_params(int argc,
  *-------------------------------------------------------------------------
  */
 
-static int open_input_files(struct vc_vars * vars_ptr)
+static int open_input_file(struct vc_vars * vars_ptr)
 {
    struct stat buf;
 
@@ -1803,7 +1700,7 @@ static int open_input_files(struct vc_vars * vars_ptr)
 
    return TRUE;
 
-} /* open_input_files */
+} /* open_input_file */
 
 
 /*-------------------------------------------------------------------------
@@ -1961,8 +1858,8 @@ static int
 map_test_buf(off_t test_buf_offset,
              char test_buf[],
              int test_buf_len,
-             struct seq_header seq_map[],
-             int seq_map_len,
+             struct seq_header map[],
+             int map_len,
              int * seq_count_ptr,
              struct vc_vars * vars_ptr)
 {
@@ -1974,14 +1871,13 @@ map_test_buf(off_t test_buf_offset,
    int line_count = 0;
    int assignment_errors[4];
    int proceed = TRUE;
-   struct line_header *line_map = (struct line_header *)malloc(
-     seq_map_len * LINES_PER_SEQ * sizeof(struct line_header));
+   struct line_header line_map[2 * MAX_SEQUENCE_LEN];
 
    proceed = map_test_buf_lines(test_buf_offset,
                                 test_buf,
                                 test_buf_len,
                                 line_map,
-                                seq_map_len * LINES_PER_SEQ,
+                                2 * MAX_SEQUENCE_LEN,
                                 &line_count,
                                 vars_ptr);
 
@@ -2060,7 +1956,7 @@ map_test_buf(off_t test_buf_offset,
       {
          proceed = FALSE;
 
-         fprintf(stderr, "\n\nERROR: Unable to construct error free sequence seq_map.\n");
+         fprintf(stderr, "\n\nERROR: Unable to construct error free sequence map.\n");
          fprintf(stderr, "	Best offset = %d, Best err count = %d.\n\n",
                  best_offset, min_errs);
 
@@ -2077,7 +1973,6 @@ map_test_buf(off_t test_buf_offset,
        * ways of disambiguating the situation.  However, for now
        * just test to see if the situation occurs.
        */
-
       for ( i = 0; i < 4 ; i++ )
       {
          assert((i == best_offset) ||
@@ -2085,43 +1980,42 @@ map_test_buf(off_t test_buf_offset,
       }
    }
 
-   if ( proceed ) /* construct the sequence seq_map */
+   if ( proceed ) /* construct the sequence map */
    {
       j = 0;
       for (i = best_offset; i < line_count; i += 4)
       {
          if ( i + 3 < line_count )
          {
-            assert(j < seq_map_len);
+            assert(j < map_len);
 
-            seq_map[j].offsets[0]  = line_map[i].offset;
-            seq_map[j].lines[0]    = line_map[i].line_ptr;
-            seq_map[j].line_len[0] = line_map[i].line_len;
-            seq_map[j].flags[0]    = line_map[i].id_flags;
+            map[j].offsets[0]  = line_map[i].offset;
+            map[j].lines[0]    = line_map[i].line_ptr;
+            map[j].line_len[0] = line_map[i].line_len;
+            map[j].flags[0]    = line_map[i].id_flags;
 
-            seq_map[j].offsets[1]  = line_map[i + 1].offset;
-            seq_map[j].lines[1]    = line_map[i + 1].line_ptr;
-            seq_map[j].line_len[1] = line_map[i + 1].line_len;
-            seq_map[j].flags[1]    = line_map[i + 1].id_flags;
+            map[j].offsets[1]  = line_map[i + 1].offset;
+            map[j].lines[1]    = line_map[i + 1].line_ptr;
+            map[j].line_len[1] = line_map[i + 1].line_len;
+            map[j].flags[1]    = line_map[i + 1].id_flags;
 
-            seq_map[j].offsets[2]  = line_map[i + 2].offset;
-            seq_map[j].lines[2]    = line_map[i + 2].line_ptr;
-            seq_map[j].line_len[2] = line_map[i + 2].line_len;
-            seq_map[j].flags[2]    = line_map[i + 2].id_flags;
+            map[j].offsets[2]  = line_map[i + 2].offset;
+            map[j].lines[2]    = line_map[i + 2].line_ptr;
+            map[j].line_len[2] = line_map[i + 2].line_len;
+            map[j].flags[2]    = line_map[i + 2].id_flags;
 
-            seq_map[j].offsets[3]  = line_map[i + 3].offset;
-            seq_map[j].lines[3]    = line_map[i + 3].line_ptr;
-            seq_map[j].line_len[3] = line_map[i + 3].line_len;
-            seq_map[j].flags[3]    = line_map[i + 3].id_flags;
+            map[j].offsets[3]  = line_map[i + 3].offset;
+            map[j].lines[3]    = line_map[i + 3].line_ptr;
+            map[j].line_len[3] = line_map[i + 3].line_len;
+            map[j].flags[3]    = line_map[i + 3].id_flags;
 
             j++;
          }
       }
 
-      *seq_count_ptr = j - 1;
+      *seq_count_ptr = j + 1;
    }
 
-   free(line_map);
    return(proceed);
 
 } /* map_test_buf() */
@@ -2146,7 +2040,7 @@ map_test_buf_lines(off_t test_buf_offset,
                    char test_buf[],
                    int test_buf_len,
                    struct line_header line_map[],
-                   int line_map_len,
+                   int map_len,
                    int *line_count_ptr,
                    struct vc_vars * vars_ptr)
 {
@@ -2169,7 +2063,7 @@ map_test_buf_lines(off_t test_buf_offset,
    assert(test_buf != NULL);
    assert(test_buf_len > 0);
    assert(line_map != NULL);
-   assert(line_map_len > 0);
+   assert(map_len > 0);
    assert(line_count_ptr != NULL);
    assert(vars_ptr != NULL);
 
@@ -2178,7 +2072,7 @@ map_test_buf_lines(off_t test_buf_offset,
       state = nulling_new_line;
    }
 
-   while ( ( proceed ) && ( i < test_buf_len ) && ( j < line_map_len ) )
+   while ( ( proceed ) && ( i < test_buf_len ) )
    {
       switch ( state )
       {
@@ -2193,6 +2087,8 @@ map_test_buf_lines(off_t test_buf_offset,
             break;
 
          case starting_line:
+            assert(j < map_len);
+
             /* initialze the map entry for this line.  Setting line_len
              * to zero below is not a typo, as we are going to change state
              * to scanning_line and fall through to that state.
@@ -2253,7 +2149,7 @@ map_test_buf_lines(off_t test_buf_offset,
                j++;
                line_count++;
 
-               assert(j <= line_map_len);
+               assert(j < map_len);
 
                state = nulling_new_line;
             }
@@ -2370,7 +2266,7 @@ map_test_buf_lines(off_t test_buf_offset,
    assert(line_count >= 8);
 
    /* null out the rest of the line map */
-   for ( j = line_count; j < line_map_len; j++ )
+   for ( j = line_count; j < map_len; j++ )
    {
       line_map[j].line_ptr = NULL;
       line_map[j].offset = (off_t)0;
@@ -2378,7 +2274,7 @@ map_test_buf_lines(off_t test_buf_offset,
       line_map[j].id_flags = 0;
    }
 
-   *line_count_ptr = line_count - 1;
+   *line_count_ptr = line_count;
 
    return(proceed);
 
@@ -2393,7 +2289,7 @@ map_test_buf_lines(off_t test_buf_offset,
  *		If neither vars_ptr->output_file_name nor
  *		vars_ptr->output_fifo_name are defined, simply
  *		set vars_ptr->output_fd to STDOUT_FILENO.
- *
+ *		
  *		If vars_ptr->output_file_name is defined, assert
  *		that vars_ptr->output_fifo_name is undefined.  Then
  *		attempt to open the file O_WRONLY / O_APPEND O_CREAT.
@@ -2627,13 +2523,6 @@ usage: vc [OPTIONS] <input FASTQ file>\n\
                                                  are identical up to a \" \"\n\
                                                  (space) character.\n\
 \n\
-      -r f               Input (mis)match ratio.  When multiple input files\n\
-                         are specified, their sizes should not differ by\n\
-                         more than a factor of f, an fp number.  f controls\n\
-                         the size of the search area when trying to match\n\
-                         the sequences in the aux input file to those in\n\
-                         the primary input file.  The default is .0001.\n\
-\n\
       -f <file name>     Name of the file to which to write the chunk.\n\
 \n\
       -p <FIFO name>     Name of the FIFO (AKA named pipe) to which to  \n\
@@ -2833,9 +2722,9 @@ merge_chunks(struct vc_vars * vars_ptr)
    assert(vars_ptr->aux_input_fd >= 0);
    assert(vars_ptr->output_fd >= 0);
 
-   char *in_buf = malloc(IO_BUF_SIZE);
-   char *aux_buf = malloc(IO_BUF_SIZE);
-   char *out_buf = malloc(2 * IO_BUF_SIZE);
+   char *in_buf = malloc(IO_BUF_SIZE / 2);
+   char *aux_buf = malloc(IO_BUF_SIZE / 2);
+   char *out_buf = malloc(IO_BUF_SIZE);
    off_t in_offset;
    off_t aux_offset;
    size_t in_bytes_remaining;
@@ -2860,15 +2749,23 @@ merge_chunks(struct vc_vars * vars_ptr)
       //
       // Load buffers from the input and aux input files.
       //
-      off_t in_bytes = (in_bytes_remaining < IO_BUF_SIZE) ?
-         in_bytes_remaining : IO_BUF_SIZE;
+      off_t in_bytes = (in_bytes_remaining < IO_BUF_SIZE / 2) ?
+         in_bytes_remaining : IO_BUF_SIZE / 2;
       if ( ! load_buf_from_file(vars_ptr->input_fd, in_offset, in_bytes,
-         in_buf, vars_ptr) ) goto error_exit;
+         in_buf, vars_ptr) )
+      {
+         fprintf(stderr, "Error: I/O buffer size too small (input file).\n");
+         goto error_exit;
+      }
 
-      off_t aux_bytes = (aux_bytes_remaining < IO_BUF_SIZE) ?
-         aux_bytes_remaining : IO_BUF_SIZE;
+      off_t aux_bytes = (aux_bytes_remaining < IO_BUF_SIZE / 2) ?
+         aux_bytes_remaining : IO_BUF_SIZE / 2;
       if ( ! load_buf_from_file(vars_ptr->aux_input_fd, aux_offset, aux_bytes,
-         aux_buf, vars_ptr) ) goto error_exit;
+         aux_buf, vars_ptr) )
+      {
+         fprintf(stderr, "Error: I/O buffer size too small (aux input file).\n");
+         goto error_exit;
+      }
 
       //
       // Merge the two buffers, read-by-read
@@ -2887,49 +2784,59 @@ merge_chunks(struct vc_vars * vars_ptr)
          // Scan for the 4th newline in each of the input buffers.
          // Check that the sequence ids/names match in the first line.
          //
-         if ( (in_nl = strchr(in_scan, '\n')) == NULL ) goto error_exit;
-         if ( (aux_nl = strchr(aux_scan, '\n')) == NULL ) goto error_exit;
+         if ( (in_nl = strchr(in_scan, '\n')) == NULL ) break;
+         if ( (aux_nl = strchr(aux_scan, '\n')) == NULL ) break;
          if ( !name_match(in_scan, aux_scan, vars_ptr) )
          {
-             *in_nl = '\0';
-             *aux_nl = '\0';
+            *in_nl = '\0';
+            *aux_nl = '\0';
             fprintf(stderr, "Error: Sequence id's do not match:\n%s\n%s\n",
                in_scan, aux_scan);
+            goto error_exit;
          }
-         if ( (in_nl = strchr(in_scan, '\n')) == NULL ) goto error_exit;
-         if ( (aux_nl = strchr(aux_scan, '\n')) == NULL ) goto error_exit;
-         if ( (in_nl = strchr(in_scan, '\n')) == NULL ) goto error_exit;
-         if ( (aux_nl = strchr(aux_scan, '\n')) == NULL ) goto error_exit;
-         if ( (in_nl = strchr(in_scan, '\n')) == NULL ) goto error_exit;
-         if ( (aux_nl = strchr(aux_scan, '\n')) == NULL ) goto error_exit;
-         assert (in_nl - in_buf < IO_BUF_SIZE);
-         assert (aux_nl - aux_buf < IO_BUF_SIZE);
+         if ( (in_nl = strchr(++in_nl, '\n')) == NULL ) break;
+         if ( (aux_nl = strchr(++aux_nl, '\n')) == NULL ) break;
+         if ( (in_nl = strchr(++in_nl, '\n')) == NULL ) break;
+         if ( (aux_nl = strchr(++aux_nl, '\n')) == NULL ) break;
+         if ( (in_nl = strchr(++in_nl, '\n')) == NULL ) break;
+         if ( (aux_nl = strchr(++aux_nl, '\n')) == NULL ) break;
+         assert (in_nl - in_buf < IO_BUF_SIZE / 2);
+         assert (aux_nl - aux_buf < IO_BUF_SIZE / 2);
 
          //
          // Check if there is still room for both records in the output buffer.
          //
          int in_len = in_nl - in_scan + 1;
          int aux_len = aux_nl - aux_scan + 1;
-         if ( out_scan + in_len + aux_len > out_buf + 2 * IO_BUF_SIZE ) break;
+         if ( out_scan + in_len + aux_len > out_buf + IO_BUF_SIZE ) break;
 
          //
          // Copy both records to the outupt buffer and update the scan pointers.
          //
          strncpy(out_scan, in_scan, in_len);
-         out_scan += in_len;
          in_scan += in_len;
-         strncpy(out_scan, aux_scan, aux_len);
-         out_scan += aux_len;
-         aux_scan += aux_len;
-
+         in_offset += in_len;
+         assert(in_bytes_remaining >= in_len);
          in_bytes_remaining -= in_len;
-         assert(aux_bytes_remaining > aux_len);
+         out_scan += in_len;
+
+         strncpy(out_scan, aux_scan, aux_len);
+         aux_scan += aux_len;
+         aux_offset += aux_len;
+         assert(aux_bytes_remaining >= aux_len);
          aux_bytes_remaining -= aux_len;
+         out_scan += aux_len;
+
+         if ( in_bytes_remaining == 0 )
+         {
+            assert(aux_bytes_remaining == 0);
+            break;
+         }
       }
 
-      if ( out_scan > out_buf + 2 * IO_BUF_SIZE )
+      if ( out_scan > out_buf + IO_BUF_SIZE )
       {
-         fprintf(stderr, "Error: I/O buffer size too small.\n");
+         fprintf(stderr, "Error: I/O buffer size too small (output file).\n");
          goto error_exit;
       }
 
@@ -2971,7 +2878,6 @@ main(int argc,
       /* chunk_len              */ (unsigned long long)0,
       /* chunk_index            */ (unsigned long long)-1,
       /* max_chunk_index        */ (unsigned long long)-1,
-      /* input_match_ratio      */ 0.0001,
       /* name_pattern           */ np_none,
       /* verbosity              */ 0,
       /*                        */
@@ -3027,12 +2933,13 @@ main(int argc,
 
    if ( vars.verbosity >= 3 ) dump_params(&vars);
 
-   if ( proceed ) proceed = open_input_files(&vars);
+   if ( proceed ) proceed = open_input_file(&vars);
 
    if ( vars.dry_run ) /* compute all chunk end points, then exit */
    {
       if ( proceed ) proceed = dry_run(&vars);
-      if ( vars.input_fd != -1 ) close_input_files(&vars);
+      if ( vars.input_fd != -1 )
+         close_input_file(&vars);
       return(!proceed);
    }
 
@@ -3047,7 +2954,7 @@ main(int argc,
 
    if ( proceed )
    {
-      if ( vars.aux_input_fd >= 0 )
+      if ( vars.aux_input_fd < 0 )
          proceed = copy_chunk(&vars);
       else
          proceed = merge_chunks(&vars);
@@ -3055,7 +2962,7 @@ main(int argc,
 
    if ( vars.output_fd != -1 ) takedown_output_fd(&vars);
 
-   if ( vars.input_fd != -1 ) close_input_files(&vars);
+   if ( vars.input_fd != -1 ) close_input_file(&vars);
 
    return(!proceed);
 
