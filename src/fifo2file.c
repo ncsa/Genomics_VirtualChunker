@@ -188,6 +188,20 @@ open_input_fifo(struct fifo2file_vars * vars_ptr)
    assert(vars_ptr->input_fd == -1);
 
    errno = 0;
+   fd = mkfifo(vars_ptr->input_fifo_name, S_IRUSR|S_IWUSR);
+   saved_errno = errno;
+
+   if ( fd == -1 )
+   {
+      proceed = FALSE;
+
+      fprintf(stderr, "\nCant't create input fifo \"%s\".\n",
+              vars_ptr->input_fifo_name);
+      fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+              strerror(saved_errno));
+   }
+
+   errno = 0;
    fd = open(vars_ptr->input_fifo_name, O_RDONLY);
    saved_errno = errno;
 

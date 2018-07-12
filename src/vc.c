@@ -9,6 +9,20 @@
 #include <assert.h>
 #include <ctype.h>
 
+//
+// PARALLEL_OUTPUT must be defined in order to avoid deadlock if the output
+// is two pipes to the same consumer process (presumably, the aligner)!!
+//
+// If the consumer tries to read a block from the first pipe that is smaller
+// than the entire output, and then read a block from the second pipe, it
+// will block waiting on vc, while vc is waiting to finish writing to the
+// first pipe.
+//
+#define PARALLEL_OUTPUT
+#ifdef PARALLEL_OUTPUT
+#include <pthread.h>
+#endif
+
 
 /* #defines */
 
@@ -73,6 +87,7 @@ struct vc_vars
    int input_fd;
    int aux_input_fd;
    int output_fd;
+   int aux_output_fd;
 
    /* variables supporting dry runs / debugging */
    char * first_lines[4];
@@ -89,6 +104,8 @@ struct vc_vars
    char aux_input_file_name[MAX_PATH_LEN +1];
    char output_file_name[MAX_PATH_LEN +1];
    char output_fifo_name[MAX_PATH_LEN +1];
+   char aux_output_file_name[MAX_PATH_LEN +1];
+   char aux_output_fifo_name[MAX_PATH_LEN +1];
 };
 
 struct line_header
@@ -132,7 +149,7 @@ struct dry_run_chunk_record
 
 /* function declarations */
 
-static void close_input_file(struct vc_vars * vars_ptr);
+static void close_input_files(struct vc_vars * vars_ptr);
 static int compute_actual_chunk_end_point(struct vc_vars * vars_ptr);
 static int compute_actual_chunk_start_point(struct vc_vars * vars_ptr);
 static int compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr);
@@ -148,8 +165,7 @@ static void dump_line_map(struct line_header line_map[], int line_count);
 static void dump_seq_map(struct seq_header map[], int seq_count);
 static int get_params(int argc, char *argv[], struct vc_vars * vars_ptr);
 static int open_input_file(struct vc_vars * vars_ptr);
-static int load_buf_from_file(int fd, off_t offset, off_t buf_len,
-                              char *buf_ptr, struct vc_vars * vars_ptr);
+static int load_buf(int fd, off_t offset, off_t buf_len, char *buf_ptr);
 static int map_test_buf(off_t test_buf_offset, char test_buf[],
                         int test_buf_len, struct seq_header map[], int map_len,
                         int * seq_count_ptr, struct vc_vars * vars_ptr);
@@ -157,19 +173,19 @@ static int map_test_buf_lines(off_t test_buf_offset, char test_buf[],
                               int test_buf_len, struct line_header line_map[],
                               int map_len, int *line_count_ptr,
                               struct vc_vars * vars_ptr);
-static int setup_output_fd(struct vc_vars * vars_ptr);
-static void takedown_output_fd(struct vc_vars * vars_ptr);
+static int setup_output_fds(struct vc_vars * vars_ptr);
+static void takedown_output_fds(struct vc_vars * vars_ptr);
 static void usage(void);
-static int write_buf_to_output_fd(off_t buf_len, char *buf_ptr,
-                                  struct vc_vars * vars_ptr);
-static int copy_chunk(struct vc_vars * vars_ptr);
+static int write_buf(int output_fd, off_t buf_len, char *buf_ptr);
+static int copy_chunk(int output_fd, int input_fd, off_t chunk_start,
+                      off_t chunk_end);
 static int merge_chunks(struct vc_vars * vars_ptr);
 
 
 /*-------------------------------------------------------------------------
- * Function:    close_input_file()
+ * Function:    close_input_files()
  *
- * Purpose:     Attempt to close the input file.  Generate an error
+ * Purpose:     Attempt to close the input file(s).  Generate an error
  *		error message on failure.
  *
  *		Note that we use file descriptor based I/O here because
@@ -181,15 +197,16 @@ static int merge_chunks(struct vc_vars * vars_ptr);
  *-------------------------------------------------------------------------
  */
 static void
-close_input_file(struct vc_vars * vars_ptr)
+close_input_files(struct vc_vars * vars_ptr)
 {
    int result;
    int saved_errno;
 
    assert(vars_ptr != NULL);
    assert(strlen(vars_ptr->input_file_name) > 0);
-   assert(vars_ptr->input_fd != -1);
+   assert(vars_ptr->input_fd >= 0);
 
+   // close the primary input file
    errno = 0;
    result = close(vars_ptr->input_fd);
    saved_errno = errno;
@@ -206,9 +223,29 @@ close_input_file(struct vc_vars * vars_ptr)
       vars_ptr->input_fd = -1;
    }
 
-   return;
+   if ( vars_ptr->aux_input_fd == -1 )
+   {
+      // only one input file
+      return;
+   }
 
-} /* close_input_file() */
+   // close the aux input file
+   errno = 0;
+   result = close(vars_ptr->aux_input_fd);
+   saved_errno = errno;
+
+   if ( result == -1 )
+   {
+      fprintf(stderr, "\nERROR: Can't close aux input file \"%s\".\n",
+              vars_ptr->aux_input_file_name);
+      fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+              strerror(saved_errno));
+   }
+   else
+   {
+      vars_ptr->aux_input_fd = -1;
+   }
+} /* close_input_files() */
 
 
 /*-------------------------------------------------------------------------
@@ -261,8 +298,7 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
    test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
    assert(test_buf_start + test_buf_len < vars_ptr->input_file_len);
 
-   if ( ! load_buf_from_file(vars_ptr->input_fd, test_buf_start, test_buf_len,
-     test_buf, vars_ptr) )
+   if ( ! load_buf(vars_ptr->input_fd, test_buf_start, test_buf_len, test_buf) )
       return FALSE;
 
    if ( ! map_test_buf(test_buf_start, test_buf, test_buf_len, map,
@@ -321,9 +357,9 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
       {
          if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
          {
-             fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
-             fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i].lines[0], map[i + 1].lines[0]);
-             fprintf(stdout, "Split at previous chunk instead.\n");
+            fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
+            fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i].lines[0], map[i + 1].lines[0]);
+            fprintf(stdout, "Split at previous chunk instead.\n");
          }
 
          i--;
@@ -412,8 +448,8 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
    test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
    assert(test_buf_start + test_buf_len < vars_ptr->aux_input_file_len);
 
-   if ( ! load_buf_from_file(vars_ptr->aux_input_fd, test_buf_start,
-     test_buf_len, aux_test_buf, vars_ptr) )
+   if ( ! load_buf(vars_ptr->aux_input_fd, test_buf_start, test_buf_len,
+     aux_test_buf) )
       return FALSE;
 
    if ( ! map_test_buf(test_buf_start, aux_test_buf, test_buf_len, map,
@@ -535,8 +571,7 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
    test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
    assert(test_buf_start + test_buf_len < vars_ptr->input_file_len);
 
-   if (! load_buf_from_file(vars_ptr->input_fd, test_buf_start, test_buf_len,
-     test_buf, vars_ptr) )
+   if (! load_buf(vars_ptr->input_fd, test_buf_start, test_buf_len, test_buf) )
       return FALSE;
 
    if (! map_test_buf(test_buf_start, test_buf, test_buf_len, map,
@@ -590,9 +625,9 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
       {
          if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
          {
-             fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
-             fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i - 1].lines[0], map[i].lines[0]);
-             fprintf(stdout, "Split at previous chunk instead.\n");
+            fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
+            fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i - 1].lines[0], map[i].lines[0]);
+            fprintf(stdout, "Split at previous chunk instead.\n");
          }
 
          i--;
@@ -669,8 +704,8 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
    test_buf_len = (off_t)(4 * MAX_SEQUENCE_LEN);
    assert(test_buf_start + test_buf_len < vars_ptr->input_file_len);
 
-   if (! load_buf_from_file(vars_ptr->aux_input_fd, test_buf_start,
-     test_buf_len, aux_test_buf, vars_ptr) )
+   if (! load_buf(vars_ptr->aux_input_fd, test_buf_start, test_buf_len,
+     aux_test_buf) )
       return FALSE;
 
    if (! map_test_buf(test_buf_start, aux_test_buf, test_buf_len, map,
@@ -1234,20 +1269,24 @@ dump_params(struct vc_vars * vars_ptr)
    assert(vars_ptr != NULL);
 
    fprintf(stdout, "\n\nParameters:\n\n");
-   fprintf(stdout, "   dry_run             = %d\n", vars_ptr->dry_run);
-   fprintf(stdout, "   chunk_len           = %llu\n", vars_ptr->chunk_len);
-   fprintf(stdout, "   chunk_index         = %llu\n", vars_ptr->chunk_index);
-   fprintf(stdout, "   max_chunk_index     = %llu\n", vars_ptr->max_chunk_index);
-   fprintf(stdout, "   name_pattern        = %d\n\n", vars_ptr->name_pattern);
-   fprintf(stdout, "   input_file_name     = \"%s\"\n",
+   fprintf(stdout, "   dry_run              = %d\n", vars_ptr->dry_run);
+   fprintf(stdout, "   chunk_len            = %llu\n", vars_ptr->chunk_len);
+   fprintf(stdout, "   chunk_index          = %llu\n", vars_ptr->chunk_index);
+   fprintf(stdout, "   max_chunk_index      = %llu\n", vars_ptr->max_chunk_index);
+   fprintf(stdout, "   name_pattern         = %d\n\n", vars_ptr->name_pattern);
+   fprintf(stdout, "   input_file_name      = \"%s\"\n",
            vars_ptr->input_file_name);
-   fprintf(stdout, "   aux_input_file_name = \"%s\"\n",
+   fprintf(stdout, "   aux_input_file_name  = \"%s\"\n",
            vars_ptr->aux_input_file_name);
-   fprintf(stdout, "   output_file_name    = \"%s\"\n",
+   fprintf(stdout, "   output_file_name     = \"%s\"\n",
            vars_ptr->output_file_name);
-   fprintf(stdout, "   output_fifo_name    = \"%s\"\n",
+   fprintf(stdout, "   output_fifo_name     = \"%s\"\n",
            vars_ptr->output_fifo_name);
-   fprintf(stdout, "   verbosity           = %d\n\n", vars_ptr->verbosity);
+   fprintf(stdout, "   aux_output_file_name = \"%s\"\n",
+           vars_ptr->aux_output_file_name);
+   fprintf(stdout, "   aux_output_fifo_name = \"%s\"\n",
+           vars_ptr->aux_output_fifo_name);
+   fprintf(stdout, "   verbosity            = %d\n\n", vars_ptr->verbosity);
 
    return;
 
@@ -1490,7 +1529,18 @@ get_params(int argc,
                fprintf(stderr, "\nSYNTAX ERROR: Output file path too long.\n\n");
                return FALSE;
             }
-            strcpy(vars_ptr->output_file_name, optarg);
+
+            if ( ( strlen(vars_ptr->output_file_name) == 0 )
+              && ( strlen(vars_ptr->output_fifo_name) == 0 ) )
+               strcpy(vars_ptr->output_file_name, optarg);
+            else if ( ( strlen(vars_ptr->aux_output_file_name) == 0 )
+              && ( strlen(vars_ptr->aux_output_fifo_name) == 0 ) )
+               strcpy(vars_ptr->aux_output_file_name, optarg);
+            else
+            {
+               fprintf(stderr, "\nSYNTAX ERROR: At most two output files/FIFOs allowed.\n\n");
+               return FALSE;
+            }
             break;
 
          case 'p':
@@ -1499,7 +1549,17 @@ get_params(int argc,
                fprintf(stderr, "\nSYNTAX ERROR: Output FIFO (AKA named pipe) path too long.\n\n");
                return FALSE;
             }
-            strcpy(vars_ptr->output_fifo_name, optarg);
+            if ( ( strlen(vars_ptr->output_file_name) == 0 )
+              && ( strlen(vars_ptr->output_fifo_name) == 0 ) )
+               strcpy(vars_ptr->output_fifo_name, optarg);
+            else if ( ( strlen(vars_ptr->aux_output_file_name) == 0 )
+              && ( strlen(vars_ptr->aux_output_fifo_name) == 0 ) )
+               strcpy(vars_ptr->aux_output_fifo_name, optarg);
+            else
+            {
+               fprintf(stderr, "\nSYNTAX ERROR: At most two output files/FIFOs allowed.\n\n");
+               return FALSE;
+            }
             break;
 
          case 'v':
@@ -1516,30 +1576,13 @@ get_params(int argc,
       }
    }
 
-   if ( ( ! have_chunk_size ) && ( ! have_max_chunk_index ) )
-   {
-      fprintf(stderr, "\nSYNTAX ERROR: Neither chunk size nor max chunk index specified.\n\n");
-      return FALSE;
-   }
-   if ( ! have_chunk_index )
-   {
-      if ( ! vars_ptr->dry_run ) {
-         fprintf(stderr, "\nSYNTAX ERROR: Chunk index not specified.\n\n");
-         return FALSE;
-      }
-      vars_ptr->chunk_index = 0;  // to avoid asserts
-   }
-   if ( ( strlen(vars_ptr->output_file_name) > 0 )
-      && ( strlen(vars_ptr->output_fifo_name) > 0 ) )
-   {
-      fprintf(stderr, "\nSYNTAX ERROR: Both output file and output fifo defined?\n\n");
-      return FALSE;
-   }
-
+   //
+   // Process the I/O files/fifo stuff.
+   //
    if ( optind < (argc - 2) )
    {
- fprintf(stderr, "argc = %d optind = %d\n", argc, optind);
-      fprintf(stderr, "\nSYNTAX ERROR: Input file must be last arg.\n\n");
+      fprintf(stderr, "argc = %d optind = %d\n", argc, optind);
+      fprintf(stderr, "\nSYNTAX ERROR: Input file(s) must be last arg(s).\n\n");
       return FALSE;
    }
    if ( optind >= argc )
@@ -1579,10 +1622,40 @@ get_params(int argc,
       }
       if ( vars_ptr->name_pattern == np_none )
       {
-         fprintf(stderr, "\nSYNTAX ERROR: Sequence ID must be specified with multiple input files.\n\n");
+         fprintf(stderr, "\nSYNTAX ERROR: Name pattern must be specified with multiple input files.\n\n");
          return FALSE;
       }
       strcpy(vars_ptr->aux_input_file_name, argv[optind+1]);
+   }
+
+   assert( ( strlen(vars_ptr->output_file_name) == 0 )
+     || ( strlen(vars_ptr->output_fifo_name) == 0 ) );
+   assert( ( strlen(vars_ptr->aux_output_file_name) == 0 )
+     || ( strlen(vars_ptr->aux_output_fifo_name) == 0 ) );
+
+   if ( ( ( strlen(vars_ptr->aux_output_file_name) > 0 )
+      || ( strlen(vars_ptr->aux_output_fifo_name) > 0 ) )
+      && ( strlen(vars_ptr->aux_input_file_name) == 0 ) )
+   {
+      fprintf(stderr, "\nSYNTAX ERROR: Multiple output files specified for single input file.\n\n");
+      return FALSE;
+   }
+
+   //
+   // Perform whatever other checks we can at this point.
+   //
+   if ( ( ! have_chunk_size ) && ( ! have_max_chunk_index ) )
+   {
+      fprintf(stderr, "\nSYNTAX ERROR: Neither chunk size nor max chunk index specified.\n\n");
+      return FALSE;
+   }
+   if ( ! have_chunk_index )
+   {
+      if ( ! vars_ptr->dry_run ) {
+         fprintf(stderr, "\nSYNTAX ERROR: Chunk index not specified.\n\n");
+         return FALSE;
+      }
+      vars_ptr->chunk_index = 0;  // to avoid asserts
    }
 
    return TRUE;
@@ -1668,7 +1741,7 @@ static int open_input_file(struct vc_vars * vars_ptr)
       return FALSE;
    }
 
-   if ( (vars_ptr->aux_input_file_name)[0] == '\0')
+   if ( strlen(vars_ptr->aux_input_file_name) == 0 )
    {
       // only one input file
       return TRUE;
@@ -1705,7 +1778,7 @@ static int open_input_file(struct vc_vars * vars_ptr)
 
 /*-------------------------------------------------------------------------
  *
- * Function:    load_buf_from_input_file()
+ * Function:    load_buf()
  *
  * Purpose:     Seek to the specified location in the input file and
  *              then read the indicated number of bytes into the supplied
@@ -1722,11 +1795,7 @@ static int open_input_file(struct vc_vars * vars_ptr)
  *-------------------------------------------------------------------------
  */
 static int
-load_buf_from_file(int fd,
-                   off_t offset,
-                   off_t buf_len,
-                   char *buf_ptr,
-                   struct vc_vars * vars_ptr)
+load_buf(int input_fd, off_t offset, off_t buf_len, char *buf_ptr)
 {
    char *local_buf_ptr;
    int read_itteration = 0;
@@ -1737,14 +1806,13 @@ load_buf_from_file(int fd,
    ssize_t result;
    off_t seek_result;
 
-   assert(vars_ptr != NULL);
-   assert(fd >= 0);
+   assert(input_fd >= 0);
    assert(buf_len > 0);
 
    if ( proceed )
    {
       errno = 0;
-      if ( (off_t)-1 == lseek(fd, offset, SEEK_SET) )
+      if ( (off_t)-1 == lseek(input_fd, offset, SEEK_SET) )
       {
          saved_errno = errno;
 
@@ -1762,7 +1830,7 @@ load_buf_from_file(int fd,
    while ( ( proceed ) && ( bytes_read < (ssize_t)buf_len ) )
    {
       errno = 0;
-      result = read(fd, (void *)local_buf_ptr, local_buf_len);
+      result = read(input_fd, (void *)local_buf_ptr, local_buf_len);
       saved_errno = errno;
 
       if ( result == -1 )
@@ -1791,7 +1859,7 @@ load_buf_from_file(int fd,
 
    return(proceed);
 
-} /* load_buf_from_file() */
+} /* load_buf() */
 
 
 /*-------------------------------------------------------------------------
@@ -2282,7 +2350,7 @@ map_test_buf_lines(off_t test_buf_offset,
 
 
 /*-------------------------------------------------------------------------
- * Function:    setup_output_fd
+ * Function:    setup_output_fds
  *
  * Purpose:	Setup the file descriptor to be used for output.
  *
@@ -2292,7 +2360,7 @@ map_test_buf_lines(off_t test_buf_offset,
  *		
  *		If vars_ptr->output_file_name is defined, assert
  *		that vars_ptr->output_fifo_name is undefined.  Then
- *		attempt to open the file O_WRONLY / O_APPEND O_CREAT.
+ *		attempt to open the file.
  *		If successful, set vars_ptr->output_fd to the file
  *		descriptor of the newly opened file, and return TRUE.
  *		On failure, generate an error message and return FALSE.
@@ -2313,7 +2381,7 @@ map_test_buf_lines(off_t test_buf_offset,
  *-------------------------------------------------------------------------
  */
 static int
-setup_output_fd(struct vc_vars * vars_ptr)
+setup_output_fds(struct vc_vars * vars_ptr)
 {
    int proceed = TRUE;
    int fd;
@@ -2321,43 +2389,37 @@ setup_output_fd(struct vc_vars * vars_ptr)
    int saved_errno;
 
    assert(vars_ptr != NULL);
-   assert( ! ( ( strlen(vars_ptr->output_file_name) > 0 ) && \
+   assert( ! ( ( strlen(vars_ptr->output_file_name) > 0 ) &&
                ( strlen(vars_ptr->output_fifo_name) > 0 ) ) );
    assert(vars_ptr->output_fd == -1);
 
-   if ( ( strlen (vars_ptr->output_file_name) == 0 ) &&
-        ( strlen (vars_ptr->output_fifo_name) == 0 ) )
+   if ( ( strlen(vars_ptr->output_file_name) == 0 ) &&
+        ( strlen(vars_ptr->output_fifo_name) == 0 ) )
    {
-      /* send output to stdout */
+      /* send primary output to stdout */
       vars_ptr->output_fd = STDOUT_FILENO;
    }
-   else if ( strlen (vars_ptr->output_file_name) > 0 )
+   else if ( strlen(vars_ptr->output_file_name) > 0 )
    {
-      /* send output to a normal file */
-
+      /* send primary output to a normal file */
       errno = 0;
       fd = open(vars_ptr->output_file_name,
-                O_WRONLY|O_APPEND|O_CREAT, S_IRUSR|S_IWUSR);
+                O_WRONLY|O_CREAT, S_IRUSR|S_IWUSR);
       saved_errno = errno;
 
       if ( fd == -1 )
       {
-         proceed = FALSE;
-
          fprintf(stderr, "\nERROR: Can't open output file \"%s\".\n",
                  vars_ptr->output_file_name);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
+         return FALSE;
       }
-      else
-      {
-         vars_ptr->output_fd = fd;
-      }
+      vars_ptr->output_fd = fd;
    }
    else
    {
-      /* send output to a FIFO (AKA named pipe) */
-
+      /* send primary output to a FIFO (AKA named pipe) */
       assert(strlen(vars_ptr->output_fifo_name) > 0);
 
       /* first, try to create the FIFO.  As it may already exist,
@@ -2369,45 +2431,99 @@ setup_output_fd(struct vc_vars * vars_ptr)
 
       if ( ( result == -1 ) && ( saved_errno != EEXIST ) )
       {
-         proceed = FALSE;
-
          fprintf(stderr, "\nERROR: Can't create output fifo \"%s\".\n",
-                 vars_ptr->output_fifo_name);
+           vars_ptr->output_fifo_name);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
-                 strerror(saved_errno));
+           strerror(saved_errno));
+         return FALSE;
       }
 
-      if ( proceed )
+      // Specify O_APPEND for fifo output in case the consumer already
+      // created the pipe.
+      errno = 0;
+      fd = open(vars_ptr->output_fifo_name, O_WRONLY, O_APPEND);
+      saved_errno = errno;
+
+      if ( fd == -1 )
       {
-         errno = 0;
-         fd = open(vars_ptr->output_fifo_name, O_WRONLY, O_APPEND);
-         saved_errno = errno;
-
-         if ( fd == -1 )
-         {
-            proceed = FALSE;
-
-            fprintf(stderr, "\nERROR: Can't open output fifo \"%s\".\n",
-                    vars_ptr->output_fifo_name);
-            fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
-                    strerror(saved_errno));
-         }
-         else
-         {
-            vars_ptr->output_fd = fd;
-         }
+         fprintf(stderr, "\nERROR: Can't open output fifo \"%s\".\n",
+           vars_ptr->output_fifo_name);
+         fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+           strerror(saved_errno));
+         return FALSE;
       }
+      vars_ptr->output_fd = fd;
    }
 
-   return(proceed);
+   if ( ( strlen(vars_ptr->aux_output_file_name) == 0 ) &&
+        ( strlen(vars_ptr->aux_output_fifo_name) == 0 ) )
+      return TRUE;
 
-} /* setup_output_fd() */
+   if ( strlen(vars_ptr->aux_output_file_name) > 0 )
+   {
+      /* send aux output to a normal file */
+      errno = 0;
+      fd = open(vars_ptr->aux_output_file_name,
+                O_WRONLY|O_CREAT, S_IRUSR|S_IWUSR);
+      saved_errno = errno;
+
+      if ( fd == -1 )
+      {
+         fprintf(stderr, "\nERROR: Can't open aux output file \"%s\".\n",
+           vars_ptr->aux_output_file_name);
+         fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+           strerror(saved_errno));
+         return FALSE;
+      }
+      vars_ptr->aux_output_fd = fd;
+   }
+   else
+   {
+      /* send aux output to a FIFO (AKA named pipe) */
+      assert(strlen(vars_ptr->aux_output_fifo_name) > 0);
+
+      /* first, try to create the FIFO.  As it may already exist,
+       * ignore a failure with errno == EEXIST.
+       */
+      errno = 0;
+      result = mkfifo(vars_ptr->aux_output_fifo_name, S_IRUSR|S_IWUSR);
+      saved_errno = errno;
+
+      if ( ( result == -1 ) && ( saved_errno != EEXIST ) )
+      {
+         fprintf(stderr, "\nERROR: Can't create aux output fifo \"%s\".\n",
+           vars_ptr->aux_output_fifo_name);
+         fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+           strerror(saved_errno));
+         return FALSE;
+      }
+
+      // Specify O_APPEND for fifo output in case the consumer already
+      // created the pipe.
+      errno = 0;
+      fd = open(vars_ptr->aux_output_fifo_name, O_WRONLY, O_APPEND);
+      saved_errno = errno;
+
+      if ( fd == -1 )
+      {
+         fprintf(stderr, "\nERROR: Can't open aux output fifo \"%s\".\n",
+           vars_ptr->aux_output_fifo_name);
+         fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+           strerror(saved_errno));
+         return FALSE;
+      }
+      vars_ptr->aux_output_fd = fd;
+   }
+
+   return TRUE;
+
+} /* setup_output_fds() */
 
 
 /*-------------------------------------------------------------------------
- * Function:    takedown_output_fd()
+ * Function:    takedown_output_fds()
  *
- * Purpose:     Takedown the output file descriptor.  What has to be
+ * Purpose:     Takedown the output file descriptor(s).  What has to be
  *		done depends on its value.
  *
  *		if vars_ptr->output_fd == STDOUT_FILENO just set
@@ -2415,10 +2531,13 @@ setup_output_fd(struct vc_vars * vars_ptr)
  *		stdout.
  *
  *		Any other value of vars_ptr->output_fd indicates that
- *		it points to either a regular file of a FIFO (AKA
+ *		it points to either a regular file or a FIFO (AKA
  *		named pipe).  In either case we must use the close()
  *		system call to close it.  Generate an error
  *		message on failure.
+ *
+ *		Ditto for the aux_output_fd, except that it cannot be
+ *		set to STDOUT_FILENO.
  *
  *		Note that we use file descriptor based I/O here because
  *		we are working with large files, and thus may have to
@@ -2429,54 +2548,74 @@ setup_output_fd(struct vc_vars * vars_ptr)
  *-------------------------------------------------------------------------
  */
 static void
-takedown_output_fd(struct vc_vars * vars_ptr)
+takedown_output_fds(struct vc_vars * vars_ptr)
 {
    int result;
    int saved_errno;
 
    assert(vars_ptr != NULL);
-   assert( ! ( ( strlen(vars_ptr->output_file_name) > 0 ) && \
-               ( strlen(vars_ptr->output_fifo_name) > 0 ) ) );
-   assert(vars_ptr->output_fd != -1);
-
+   assert(vars_ptr->output_fd >= 0);
    if ( vars_ptr->output_fd == STDOUT_FILENO )
    {
       vars_ptr->output_fd = -1;
    }
-   else if ( strlen(vars_ptr->output_file_name) > 0 )
-   {
-      errno = 0;
-      result = close(vars_ptr->output_fd);
-      saved_errno = errno;
-
-      if ( result == -1 )
-      {
-         fprintf(stderr, "\nCan't close output file \"%s\".\n",
-                 vars_ptr->output_file_name);
-         fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
-                 strerror(saved_errno));
-      }
-   }
    else
    {
-      assert( strlen(vars_ptr->output_fifo_name) > 0 );
-
       errno = 0;
       result = close(vars_ptr->output_fd);
       saved_errno = errno;
 
       if ( result == -1 )
       {
-         fprintf(stderr, "\nERROR: Can't close output fifo \"%s\".\n",
-                 vars_ptr->output_fifo_name);
-         fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
-                 strerror(saved_errno));
+         if ( strlen(vars_ptr->output_file_name) > 0 )
+         {
+            fprintf(stderr, "\nCan't close output file \"%s\".\n",
+              vars_ptr->output_file_name);
+            fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+              strerror(saved_errno));
+         }
+         else if (strlen(vars_ptr->output_fifo_name) > 0)
+         {
+            fprintf(stderr, "\nERROR: Can't close output fifo \"%s\".\n",
+              vars_ptr->output_fifo_name);
+            fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+              strerror(saved_errno));
+         }
+         else
+            assert(0);
+      }
+   }
+
+   if ( vars_ptr->aux_output_fd != -1 )
+   {
+      errno = 0;
+      result = close(vars_ptr->aux_output_fd);
+      saved_errno = errno;
+
+      if ( result == -1 )
+      {
+         if ( strlen(vars_ptr->aux_output_file_name) > 0 )
+         {
+            fprintf(stderr, "\nCan't close aux output file \"%s\".\n",
+              vars_ptr->aux_output_file_name);
+            fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+              strerror(saved_errno));
+         }
+         else if (strlen(vars_ptr->aux_output_fifo_name) > 0)
+         {
+            fprintf(stderr, "\nERROR: Can't close aux output fifo \"%s\".\n",
+              vars_ptr->aux_output_fifo_name);
+            fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
+              strerror(saved_errno));
+         }
+         else
+            assert(0);
       }
    }
 
    return;
 
-} /* takedown_output_fd() */
+} /* takedown_output_fds() */
 
 
 /*-------------------------------------------------------------------------
@@ -2494,26 +2633,26 @@ usage (void)
  fprintf(stdout, "\
 Virtual Chunker (vc)\n\
 \n\
-purpose: Extract the specified chunk from the supplied FASTQ file, and \n\
+purpose: Extract the specified chunk from the supplied FASTQ file, and\n\
    write it to stdout, a file, or a FIFO (AKA named pipe) as specified.\n\
 \n\
-usage: vc [OPTIONS] <input FASTQ file>\n\
+usage: vc [OPTIONS] <input FASTQ file> [<aux input FASTQ file>]\n\
 \n\
    OPTIONS\n\
-      -d                 Dry run.  Compute all chunk boundaries. \n\
-                         Display if verbosity > 0. No output to file. \n\
+      -d                 Dry run.  Compute all chunk boundaries.\n\
+                         Display if verbosity > 0. No output to file.\n\
 \n\
       -s n[k|m|g]        Chunk size in kilo-bytes (if \"k\" suffix appears),\n\
-                         mega-bytes (if no suffix, or \"m\" suffix), or \n\
-                         giga-bytes (if \"g\" suffix appears). \n\
+                         mega-bytes (if no suffix, or \"m\" suffix), or\n\
+                         giga-bytes (if \"g\" suffix appears).\n\
 \n\
-      -i n               Index of the chunk to extract. \n\
-                         Ignored if dry run is specified. \n\
+      -i n               Index of the chunk to extract.\n\
+                         Ignored if dry run is specified.\n\
 \n\
-      -m n               Max chunk index (#chunks-1). \n\
+      -m n               Max chunk index (#chunks-1).\n\
 \n\
-      -n <name>          Specify the seqence id / name pattern to which a\n\
-                         vendor adheres to. It must be one of the following:\n\
+      -n <name>          Specify the name pattern to which the sequence ids\n\
+                         conform. It must be one of the following:\n\
 \n\
                            \"neat\" or \"/\" ==> The names of a read pair are\n\
                                                  identical up to a \"/\"\n\
@@ -2523,26 +2662,36 @@ usage: vc [OPTIONS] <input FASTQ file>\n\
                                                  are identical up to a \" \"\n\
                                                  (space) character.\n\
 \n\
+                         This is used to match the reads from the same strand\n\
+                         when they appear in separate input files. If two\n\
+                         input files are specified, the -n option must also\n\
+                         be specified.\n\
+\n\
       -f <file name>     Name of the file to which to write the chunk.\n\
 \n\
-      -p <FIFO name>     Name of the FIFO (AKA named pipe) to which to  \n\
+      -p <FIFO name>     Name of the FIFO (AKA named pipe) to which to \n\
                          write the chunk.\n\
 \n\
-      -v                 Verbosity.  Repeat for more output. \n\
-                           verbosity == 0 ==> output on error only \n\
-                           verbosity == 1 ==> terse functional output \n\
-                           verbosity == 2 ==> verbose functional output \n\
-                           verbosity >= 3 ==> debugging output \n\
+                         Two output files / FIFOs may be specified if two\n\
+                         input files are specified.  The reads from the\n\
+                         first (primary) input file are then copied to the\n\
+                         first (primary) output file/FIFO; the reads from\n\
+                         the second (aux) input file are then copied to the\n\
+                         second (aux) output file/FIFO\n\
 \n\
-   If chunk index is equal to max chunk index, then the delivered chunk \n\
-   will extend to the end of file, regardless of size. \n\
+      -v                 Verbosity.  Repeat for more output.\n\
+                           verbosity == 0 ==> output on error only\n\
+                           verbosity == 1 ==> terse functional output\n\
+                           verbosity == 2 ==> verbose functional output\n\
+                           verbosity >= 3 ==> debugging output\n\
 \n\
-   The -f and -p options are mutually exclusive.  If neither is provided, \n\
-   output is to stdout. \n\
+   If chunk index is equal to max chunk index, then the delivered chunk\n\
+   will extend to the end of file, regardless of size.\n\
 \n\
-   If specified, both the output file and the output FIFO will be created \n\
-   vc if they do not exist on entry.  Unlinking the FIFO is the callers \n\
-   responsibility. \n\n");
+   If neither the -f or -p option is provided, the output is to stdout.\n\
+\n\
+   If -p is specified, the output FIFO will be created by vc if it does not\n\
+   exist on entry.  Unlinking the FIFO is the callers responsibility.\n\n");
 
    return;
 
@@ -2551,11 +2700,11 @@ usage: vc [OPTIONS] <input FASTQ file>\n\
 
 /*-------------------------------------------------------------------------
  *
- * Function:    write_buf_to_output_fd()
+ * Function:    write_buf()
  *
- * Purpose:     Write the contents of the supplied buffer to the file
- *		descriptor listed in vars_ptr->output_fd.  This may be
- *		either sdtoud, a regular file, or a FIFO (AKA named pipe).
+ * Purpose:     Write the contents of the supplied buffer to the specified
+ *              file descriptor.  This may be either stdout, a regular file,
+ *              or a FIFO (AKA named pipe).
  *
  *              Return TRUE if completely successful and FALSE otherwise.
  *
@@ -2565,9 +2714,7 @@ usage: vc [OPTIONS] <input FASTQ file>\n\
  *-------------------------------------------------------------------------
  */
 static int
-write_buf_to_output_fd(off_t buf_len,
-                       char *buf_ptr,
-                       struct vc_vars * vars_ptr)
+write_buf(int output_fd, off_t buf_len, char *buf_ptr)
 {
    char *local_buf_ptr;
    int write_itteration = 0;
@@ -2577,8 +2724,7 @@ write_buf_to_output_fd(off_t buf_len,
    ssize_t bytes_written = 0;
    ssize_t result;
 
-   assert(vars_ptr != NULL);
-   assert(vars_ptr->output_fd != -1);
+   assert(output_fd >= 0);
    assert(buf_len > 0);
    assert(buf_ptr != NULL);
 
@@ -2588,8 +2734,7 @@ write_buf_to_output_fd(off_t buf_len,
    while ( ( proceed ) && ( bytes_written < (ssize_t)buf_len ) )
    {
       errno = 0;
-      result = write(vars_ptr->output_fd, (void *)local_buf_ptr,
-                     local_buf_len);
+      result = write(output_fd, (void *)local_buf_ptr, local_buf_len);
       saved_errno = errno;
 
       if ( result == -1 )
@@ -2619,21 +2764,20 @@ write_buf_to_output_fd(off_t buf_len,
 
    return(proceed);
 
-} /* write_buf_to_output_fd() */
+} /* write_buf() */
 
 
 /*-------------------------------------------------------------------------
  * Function:    copy_chunk
  *
- * Purpose:	Load the desired chunk from the input file, and write
- *		it to the output specified by vars_ptr->output_fd.
+ * Purpose:	Copy the desired chunk from the input file to the output fd.
  *
  * Return:      TRUE if successful, and FALSE otherwise.
  *
  *-------------------------------------------------------------------------
  */
 static int
-copy_chunk(struct vc_vars * vars_ptr)
+copy_chunk(int output_fd, int input_fd, off_t chunk_start, off_t chunk_end)
 {
    char * buf_ptr = NULL;
    int proceed = TRUE;
@@ -2643,9 +2787,8 @@ copy_chunk(struct vc_vars * vars_ptr)
    off_t bytes_remaining;
    off_t bytes_this_read;
 
-   assert(vars_ptr != NULL);
-   assert(vars_ptr->input_fd != -1);
-   assert(vars_ptr->output_fd != -1);
+   assert(output_fd >= 0);
+   assert(input_fd >= 0);
 
    buf_ptr = malloc(IO_BUF_SIZE);
 
@@ -2658,9 +2801,8 @@ copy_chunk(struct vc_vars * vars_ptr)
 
    if ( proceed )
    {
-      offset = vars_ptr->actual_chunk_start;
-      bytes_remaining = vars_ptr->actual_chunk_end -
-                        vars_ptr->actual_chunk_start + 1;
+      offset = chunk_start;
+      bytes_remaining = chunk_end - chunk_start + 1;
    }
 
    while ( ( proceed ) && ( bytes_remaining > 0 ) )
@@ -2680,15 +2822,14 @@ copy_chunk(struct vc_vars * vars_ptr)
          offset += bytes_this_read;
       }
 
-      proceed = load_buf_from_file(vars_ptr->input_fd, offset_this_read,
-        bytes_this_read, buf_ptr, vars_ptr);
+      proceed = load_buf(input_fd, offset_this_read, bytes_this_read, buf_ptr);
 
       if ( proceed )
-         proceed = write_buf_to_output_fd(bytes_this_read, buf_ptr, vars_ptr);
+         proceed = write_buf(output_fd, bytes_this_read, buf_ptr);
    }
 
-   assert(offset == vars_ptr->actual_chunk_end + 1);
-   assert(bytes_remaining == 0 );
+   assert(offset == chunk_end + 1);
+   assert(bytes_remaining == 0);
 
    if ( buf_ptr != NULL )
    {
@@ -2699,6 +2840,31 @@ copy_chunk(struct vc_vars * vars_ptr)
    return(proceed);
 
 } /* copy_chunk() */
+
+#ifdef PARALLEL_OUTPUT
+
+//
+// stuff to invoke copy_chunk in a separate pthread
+//
+
+struct copy_chunk_vars
+{
+   int output_fd;
+   int input_fd;
+   off_t chunk_start;
+   off_t chunk_end;
+};
+
+static void *
+invoke_copy_chunk(void *arg)
+{
+   struct copy_chunk_vars *ccv_arg = (struct copy_chunk_vars *)arg;
+   return (void *)copy_chunk(ccv_arg->output_fd, ccv_arg->input_fd,
+     ccv_arg->chunk_start, ccv_arg->chunk_end);
+
+}
+
+#endif /* PARALLEL_OUTPUT */
 
 
 /*-------------------------------------------------------------------------
@@ -2751,8 +2917,7 @@ merge_chunks(struct vc_vars * vars_ptr)
       //
       off_t in_bytes = (in_bytes_remaining < IO_BUF_SIZE / 2) ?
          in_bytes_remaining : IO_BUF_SIZE / 2;
-      if ( ! load_buf_from_file(vars_ptr->input_fd, in_offset, in_bytes,
-         in_buf, vars_ptr) )
+      if ( ! load_buf(vars_ptr->input_fd, in_offset, in_bytes, in_buf) )
       {
          fprintf(stderr, "Error: I/O buffer size too small (input file).\n");
          goto error_exit;
@@ -2760,8 +2925,7 @@ merge_chunks(struct vc_vars * vars_ptr)
 
       off_t aux_bytes = (aux_bytes_remaining < IO_BUF_SIZE / 2) ?
          aux_bytes_remaining : IO_BUF_SIZE / 2;
-      if ( ! load_buf_from_file(vars_ptr->aux_input_fd, aux_offset, aux_bytes,
-         aux_buf, vars_ptr) )
+      if ( ! load_buf(vars_ptr->aux_input_fd, aux_offset, aux_bytes, aux_buf) )
       {
          fprintf(stderr, "Error: I/O buffer size too small (aux input file).\n");
          goto error_exit;
@@ -2840,7 +3004,7 @@ merge_chunks(struct vc_vars * vars_ptr)
          goto error_exit;
       }
 
-      write_buf_to_output_fd(out_scan - out_buf, out_buf, vars_ptr);
+      write_buf(vars_ptr->output_fd, out_scan - out_buf, out_buf);
    }
    assert(in_offset == vars_ptr->actual_chunk_end + 1);
    assert(in_bytes_remaining == 0 );
@@ -2892,7 +3056,8 @@ main(int argc,
       /* input_fd               */ -1,
       /* aux_input_fd           */ -1,
       /* output_fd              */ -1,
-      /*                           */
+      /* aux_output_fd          */ -1,
+      /*                        */
       /* first_lines            */ {NULL, NULL, NULL, NULL},
       /* last_lines             */ {NULL, NULL, NULL, NULL},
       /* aux_first_lines        */ {NULL, NULL, NULL, NULL},
@@ -2916,7 +3081,9 @@ main(int argc,
       /* input_file_name        */ "",
       /* aux_input_file_name    */ "",
       /* output_file_name       */ "",
-      /* output_fifo_name       */ ""
+      /* output_fifo_name       */ "",
+      /* aux_output_file_name   */ "",
+      /* aux_output_fifo_name   */ ""
    };
 
    /* We will be working with large files (10's of GB), and thus
@@ -2939,7 +3106,7 @@ main(int argc,
    {
       if ( proceed ) proceed = dry_run(&vars);
       if ( vars.input_fd != -1 )
-         close_input_file(&vars);
+         close_input_files(&vars);
       return(!proceed);
    }
 
@@ -2950,19 +3117,96 @@ main(int argc,
 
    if ( proceed ) proceed = compute_actual_chunk_end_point(&vars);
 
-   if ( proceed ) proceed = setup_output_fd(&vars);
+   if ( proceed ) proceed = setup_output_fds(&vars);
 
    if ( proceed )
    {
-      if ( vars.aux_input_fd < 0 )
-         proceed = copy_chunk(&vars);
-      else
+      if ( ( vars.aux_input_fd >= 0 ) && ( vars.aux_output_fd < 0 ) )
          proceed = merge_chunks(&vars);
+      else if ( proceed && ( vars.aux_output_fd < 0 ) )
+         proceed = copy_chunk(vars.output_fd, vars.input_fd,
+           vars.actual_chunk_start, vars.actual_chunk_end);
+      else if ( proceed )
+      {
+         // Multiple output streams
+
+#ifndef PARALLEL_OUTPUT
+
+         proceed = copy_chunk(vars.output_fd, vars.input_fd,
+           vars.actual_chunk_start, vars.actual_chunk_end);
+         if ( proceed )
+            proceed = copy_chunk(vars.aux_output_fd, vars.aux_input_fd,
+              vars.aux_chunk_start, vars.aux_chunk_end);
+
+#else /* PARALLEL_OUTPUT */
+
+         //
+         // Fork a separate pthread to do the copy between the aux files.
+         // We need to put the arglist into a struct.
+         //
+         int rc;
+         pthread_t aux_thr_id;
+         pthread_attr_t aux_attr;
+         void *aux_res;
+         struct copy_chunk_vars aux_args =
+         {
+            vars.aux_output_fd,
+            vars.aux_input_fd,
+            vars.aux_chunk_start,
+            vars.aux_chunk_end
+         };
+
+         rc = pthread_attr_init(&aux_attr);
+         if ( rc != 0 )
+         {
+            fprintf(stderr, "Error: pthread_attr_init() returned %d\n", rc);
+            proceed = FALSE;
+         }
+         else
+         {
+            if ( vars.verbosity >= 1 )
+               fprintf(stdout, "Spawning pthread for aux copies\n");
+            rc = pthread_create(&aux_thr_id, &aux_attr, invoke_copy_chunk,
+              (void *)(&aux_args));
+            if ( rc != 0 )
+            {
+               fprintf(stderr, "Error: pthread_create() returned %d\n", rc);
+               proceed = FALSE;
+            }
+         }
+
+         if ( proceed)
+         {
+            //
+            // Do the copy between the primary files in this thread.
+            //
+            if ( vars.verbosity >= 1 )
+               fprintf(stdout, "pthread forked for aux copies - copying primary chunk in main thread\n");
+            proceed = copy_chunk(vars.output_fd, vars.input_fd,
+              vars.actual_chunk_start, vars.actual_chunk_end);
+
+            //
+            // Reap the child thread, even if there was an error
+            // in copy_chunk().
+            //
+            if ( vars.verbosity >= 1 )
+               fprintf(stdout, "Joining with child pthread\n");
+            rc = pthread_join(aux_thr_id, &aux_res);
+            if ( rc != 0 )
+            {
+               fprintf(stderr, "Error: pthread_join() returned %d\n", rc);
+               proceed = FALSE;
+            }
+         }
+
+#endif /* PARALLEL_OUTPUT */
+
+      }
    }
 
-   if ( vars.output_fd != -1 ) takedown_output_fd(&vars);
+   if ( vars.output_fd != -1 ) takedown_output_fds(&vars);
 
-   if ( vars.input_fd != -1 ) close_input_file(&vars);
+   if ( vars.input_fd != -1 ) close_input_files(&vars);
 
    return(!proceed);
 

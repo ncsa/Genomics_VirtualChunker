@@ -6,7 +6,7 @@
 
 echo -n "building vc ... "
 rm -f a.out vc
-icc -g vc.c
+icc -g -pthread vc.c
 mv a.out vc 
 echo "Done."
 
