@@ -14,7 +14,6 @@
 
 #define FALSE 0
 #define TRUE  1
-#define VC_VARS_MAGIC		0x1234
 #define MAX_PATH_LEN		1024
 #define MAX_SEQUENCE_LEN	10240
 #define IO_BUF_SIZE		((size_t)(1024 * 1024))
@@ -34,15 +33,15 @@
 #define IS_QUAL_CHAR(c) ( ( (int)(c) >= 33 ) && ( (int)(c) <= 126 ) )
 
 /*
- * specify the pattern used to distinguish between the samples for
- * the same trait on each half of a chromosone pair. <is that correct???>
- * If those two samples are continguous in the input, then vc will
- * avoid splitting the input into different chunks at that point.
+ * Specify the sequence id / name pattern used to identify a pair of reads for
+ * a single sample. vc will avoid splitting the input into different chunks
+ * between a pair of records that have matching patterns.  We refer to the
+ * patterns by the vendor name.
  */
 typedef enum name_pattern_kind {
    np_none,
    np_neat,	// neat
-   np_illumina	// illimina
+   np_illumina	// illumina
 } name_pattern_kind;
 
 
@@ -50,17 +49,12 @@ typedef enum name_pattern_kind {
 
 struct vc_vars
 {
-   unsigned magic;	/* must be set to VC_VARS_MAGIC */
-
    /* parameters */
    int dry_run;
    unsigned long long chunk_len;
    unsigned long long chunk_index;
    unsigned long long max_chunk_index;
    name_pattern_kind name_pattern;
-   char input_file_name[MAX_PATH_LEN +1];
-   char output_file_name[MAX_PATH_LEN +1];
-   char output_fifo_name[MAX_PATH_LEN +1];
    int verbosity;	/* verbosity == 0 ==> output on error only */
                         /* verbosity == 1 ==> terse functional output */
                         /* verbosity == 2 ==> verbose functional output */
@@ -80,6 +74,11 @@ struct vc_vars
    char * last_lines[4];
    off_t first_lines_offsets[4];
    off_t last_lines_offsets[4];
+
+   /* put large arrays at end of struct for performance */
+   char input_file_name[MAX_PATH_LEN +1];
+   char output_file_name[MAX_PATH_LEN +1];
+   char output_fifo_name[MAX_PATH_LEN +1];
 };
 
 struct line_header
@@ -121,9 +120,9 @@ static void close_input_file(struct vc_vars * vars_ptr);
 static int compute_actual_chunk_end_point(struct vc_vars * vars_ptr);
 static int compute_actual_chunk_start_point(struct vc_vars * vars_ptr);
 static int compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr);
-static void count_assignment_errors(int offset, struct line_header line_map[], 
+static void count_assignment_errors(int offset, struct line_header line_map[],
                                     int line_count, int * err_count_ptr);
-static int name_match(struct vc_vars * vars_ptr, char *name1, char *name2);
+static int name_match(char *name1, char *name2, struct vc_vars * vars_ptr);
 static int dry_run(struct vc_vars * vars_ptr);
 static void dry_run__dump_chunk_boundaries(
 			              struct dry_run_chunk_record * drc_array,
@@ -131,23 +130,21 @@ static void dry_run__dump_chunk_boundaries(
 static void dump_params(struct vc_vars * vars_ptr);
 static void dump_line_map(struct line_header line_map[], int line_count);
 static void dump_seq_map(struct seq_header map[], int seq_count);
-static int get_input_file_len(struct vc_vars * vars_ptr);
 static int get_params(int argc, char *argv[], struct vc_vars * vars_ptr);
+static int open_input_file(struct vc_vars * vars_ptr);
 static int load_buf_from_file(off_t offset, off_t buf_len, char *buf_ptr,
                               struct vc_vars * vars_ptr);
-static int map_test_buf(off_t test_buf_offset, char test_buf[], 
+static int map_test_buf(off_t test_buf_offset, char test_buf[],
                         int test_buf_len, struct seq_header map[], int map_len,
                         int * seq_count_ptr, struct vc_vars * vars_ptr);
-static int map_test_buf_lines(off_t test_buf_offset, char test_buf[], 
+static int map_test_buf_lines(off_t test_buf_offset, char test_buf[],
                               int test_buf_len, struct line_header line_map[],
                               int map_len, int *line_count_ptr,
                               struct vc_vars * vars_ptr);
-static void post_err_mssg(char * err_msg);
-static void post_syntax_err(char * err_msg);
 static int setup_output_fd(struct vc_vars * vars_ptr);
 static void takedown_output_fd(struct vc_vars * vars_ptr);
 static void usage(void);
-static int write_buf_to_output_fd(off_t buf_len, char *buf_ptr, 
+static int write_buf_to_output_fd(off_t buf_len, char *buf_ptr,
                                   struct vc_vars * vars_ptr);
 static int write_chunk(struct vc_vars * vars_ptr);
 
@@ -155,16 +152,14 @@ static int write_chunk(struct vc_vars * vars_ptr);
 /*-------------------------------------------------------------------------
  * Function:    close_input_file()
  *
- * Purpose:     Attempt to close the input file.  Generate an error 
+ * Purpose:     Attempt to close the input file.  Generate an error
  *		error message on failure.
  *
  *		Note that we use file descriptor based I/O here because
- *		we are working with large files, and thus may have to 
+ *		we are working with large files, and thus may have to
  *		seek to locations that cannot be represented with a long.
- * 
- * Return:      TRUE if successful, and FALSE otherwise.
  *
- * Changes:     none.
+ * Return:      TRUE if successful, and FALSE otherwise.
  *
  *-------------------------------------------------------------------------
  */
@@ -175,7 +170,6 @@ close_input_file(struct vc_vars * vars_ptr)
    int saved_errno;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert(strlen(vars_ptr->input_file_name) > 0);
    assert(vars_ptr->input_fd != -1);
 
@@ -185,7 +179,7 @@ close_input_file(struct vc_vars * vars_ptr)
 
    if ( result == -1 )
    {
-      fprintf(stderr, "\nCant't close input file \"%s\".\n",
+      fprintf(stderr, "\nERROR: Can't close input file \"%s\".\n",
               vars_ptr->input_file_name);
       fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
               strerror(saved_errno));
@@ -204,23 +198,21 @@ close_input_file(struct vc_vars * vars_ptr)
  * Function:    compute_actual_chunk_end_point()
  *
  * Purpose:     Compute the actual offset of the chunk end point.  This
- *	        is simply the offset of the end of the last complete 
+ *	        is simply the offset of the end of the last complete
  *		FASTQ sequence that begins within the nominal chunk.
  *
- *		If this is the last chunk, (i.e. chunk_index == max index), 
+ *		If this is the last chunk, (i.e. chunk_index == max index),
  *              life is easy, as the noninal end point and the actual end
  *		point are the same.
  *
- *		In all other cases, we load a buffer from the file 
+ *		In all other cases, we load a buffer from the file
  *		centered on the nominal end point, map all complete
- *		sequences in it, and set our actual start point equal 
- *		to one less than the offset in the input file of the 
- *		earliest sequence whose first character is at offset 
- *		greater than the noninal chunk end.  
+ *		sequences in it, and set our actual start point equal
+ *		to one less than the offset in the input file of the
+ *		earliest sequence whose first character is at offset
+ *		greater than the noninal chunk end.
  *
  * Return:      TRUE is successful, and FALSE if an error is detected.
- *
- * Changes:	none.
  *
  *-------------------------------------------------------------------------
  */
@@ -230,7 +222,6 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
    int proceed = TRUE;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert(vars_ptr->input_fd >= 0);
 
    if ( vars_ptr->chunk_index == vars_ptr->max_chunk_index )
@@ -259,11 +250,11 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
 
       assert(test_buf_start + test_buf_len < vars_ptr->input_file_len);
 
-      proceed = load_buf_from_file(test_buf_start, test_buf_len, 
+      proceed = load_buf_from_file(test_buf_start, test_buf_len,
                                    test_buf, vars_ptr);
 
       if ( proceed )
-         proceed = map_test_buf(test_buf_start, test_buf, test_buf_len, map, 
+         proceed = map_test_buf(test_buf_start, test_buf, test_buf_len, map,
                                 MAX_SEQUENCE_LEN / 4, &seq_count, vars_ptr);
 
       if ( proceed )
@@ -272,13 +263,13 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
 
          assert(seq_count < (MAX_SEQUENCE_LEN / 4));
 
-         while ( ( i < seq_count ) && 
+         while ( ( i < seq_count ) &&
                  ( map[i].offsets[0] <= vars_ptr->nominal_chunk_end ) )
          {
             i++;
          }
 
-         i--; /* to get back to the last sequence that starts before 
+         i--; /* to get back to the last sequence that starts before
                * the nominal end of chunk.
                */
 
@@ -301,23 +292,28 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
             {
                dump_seq_map(map, seq_count);
             }
-         } 
+         }
          else
          {
             assert(i + 1 < seq_count);
 
-            assert(map[i+1].offsets[0] - 1 >= 
+            assert(map[i+1].offsets[0] - 1 >=
                    vars_ptr->nominal_chunk_end);
-            assert(map[i+1].offsets[0] - 1 < 
-                   (vars_ptr->nominal_chunk_end + 
+            assert(map[i+1].offsets[0] - 1 <
+                   (vars_ptr->nominal_chunk_end +
                     (off_t)(2 * MAX_SEQUENCE_LEN)));
 
             if ( (i < seq_count) && (vars_ptr->name_pattern != np_none) ) {
-               /* check to see if breaking the chunks at this point would result
-                * in continguous similarly-named sequences being in different chunks.
-                * If so, then back up one sequence and break the file there.
+               /* Check to see if breaking the input into chunks at this point
+                * would result in currently-continguous reads whose names
+                * match the specified pattern being split in different chunks.
+                * If so, back up one read and break the input file there.
+                *
+                * Obviously, this logic assumes that there are only two reads
+                * which match the pattern, and they are contiguous in the
+                * input.
                 */
-               if ( name_match(vars_ptr, map[i].lines[0], map[i + 1].lines[0]) )
+               if ( name_match(map[i].lines[0], map[i + 1].lines[0], vars_ptr) )
                {
                   if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
                   {
@@ -349,32 +345,32 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
             {
                if ( vars_ptr->verbosity >= 2 )
                {
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "Sequence before actual chunk end offset = %llu\n",
                           (unsigned long long)(map[i].offsets[0]));
                   fprintf(stdout, "%s\n%s\n%s\n%s\n",
                           map[i].lines[0], map[i].lines[1],
                           map[i].lines[2], map[i].lines[3]);
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
                }
-           
+
                fprintf(stdout, "Actual chunk end offset = %llu.\n",
                        (unsigned long long)(vars_ptr->actual_chunk_end));
 
                if ( vars_ptr->verbosity >= 2 )
                {
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "Sequence after actual chunk end offset = %llu\n",
                           (unsigned long long)(map[i + 1].offsets[0]));
                   fprintf(stdout, "%s\n%s\n%s\n%s\n",
                           map[i + 1].lines[0], map[i + 1].lines[1],
                           map[i + 1].lines[2], map[i + 1].lines[3]);
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
                }
             }
@@ -398,16 +394,14 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
  *		 is easy, as the noninal start point and the actual start
  *		 point are the same.
  *
- *		 In all other cases, we load a buffer from the file 
+ *		 In all other cases, we load a buffer from the file
  *		 centered on the nominal start point, map all complete
- *		 sequences in it, and set our actual start point equal 
+ *		 sequences in it, and set our actual start point equal
  *		 to the offset in the input file of the earliest sequence
- *		 whose first character is at offset greater than or equal 
- *		 to the noninal chunk start.  
+ *		 whose first character is at offset greater than or equal
+ *		 to the noninal chunk start.
  *
  * Return:       TRUE is successful, and FALSE if an error is detected.
- *
- * Changes:	 none.
  *
  *-------------------------------------------------------------------------
  */
@@ -417,7 +411,6 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
    int proceed = TRUE;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert(vars_ptr->input_fd >= 0);
 
    if ( vars_ptr->chunk_index == 0 )
@@ -446,11 +439,11 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
 
       assert(test_buf_start + test_buf_len < vars_ptr->input_file_len);
 
-      proceed = load_buf_from_file(test_buf_start, test_buf_len, 
+      proceed = load_buf_from_file(test_buf_start, test_buf_len,
                                    test_buf, vars_ptr);
 
       if ( proceed )
-         proceed = map_test_buf(test_buf_start, test_buf, test_buf_len, map, 
+         proceed = map_test_buf(test_buf_start, test_buf, test_buf_len, map,
                                 MAX_SEQUENCE_LEN / 4, &seq_count, vars_ptr);
 
       if ( proceed )
@@ -459,7 +452,7 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
 
          assert(seq_count < (MAX_SEQUENCE_LEN / 4));
 
-         while ( ( i < seq_count ) && 
+         while ( ( i < seq_count ) &&
                  ( map[i].offsets[0] < vars_ptr->nominal_chunk_start ) )
          {
             i++;
@@ -484,21 +477,26 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
             {
                dump_seq_map(map, seq_count);
             }
-         } 
+         }
          else
          {
-            assert(map[i].offsets[0] >= 
+            assert(map[i].offsets[0] >=
                    vars_ptr->nominal_chunk_start);
-            assert(map[i].offsets[0] < 
-                   (vars_ptr->nominal_chunk_start + 
+            assert(map[i].offsets[0] <
+                   (vars_ptr->nominal_chunk_start +
                     (off_t)(2 * MAX_SEQUENCE_LEN)));
 
             if ( (i > 0) && (vars_ptr->name_pattern != np_none) ) {
-               /* check to see if breaking the chunks at this point would result
-                * in continguous similarly-named sequences being in different chunks.
-                * If so, then back up one sequence and break the file there.
+               /* Check to see if breaking the input into chunks at this point
+                * would result in currently-continguous reads whose names
+                * match the specified pattern being split in different chunks.
+                * If so, back up one read and break the input file there.
+                *
+                * Obviously, this logic assumes that there are only two reads
+                * which match the pattern, and they are contiguous in the
+                * input.
                 */
-               if ( name_match(vars_ptr, map[i - 1].lines[0], map[i].lines[0]) )
+               if ( name_match(map[i - 1].lines[0], map[i].lines[0], vars_ptr) )
                {
                   if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
                   {
@@ -530,32 +528,32 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
             {
                if ( vars_ptr->verbosity >= 2 )
                {
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "Sequence before actual chunk start offset = %llu\n",
                            (unsigned long long)(map[i - 1].offsets[0]));
                   fprintf(stdout, "%s\n%s\n%s\n%s\n",
                           map[i - 1].lines[0], map[i - 1].lines[1],
                           map[i - 1].lines[2], map[i - 1].lines[3]);
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
                }
-           
+
                fprintf(stdout, "Actual chunk start offset = %llu.\n",
                        (unsigned long long)(vars_ptr->actual_chunk_start));
 
                if ( vars_ptr->verbosity >= 2 )
                {
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "Sequence after actual chunk start offset = %llu\n",
                           (unsigned long long)(map[i].offsets[0]));
                   fprintf(stdout, "%s\n%s\n%s\n%s\n",
                           map[i].lines[0], map[i].lines[1],
                           map[i].lines[2], map[i].lines[3]);
-                  fprintf(stdout, 
+                  fprintf(stdout,
                           "==========================================\n");
                }
             }
@@ -571,32 +569,30 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
 /*-------------------------------------------------------------------------
  * Function:     compute_nominal_chunk_endpoints()
  *
- * Purpose:      Using the input file length, the chunk length, the 
- *               chunk index, and max index, compute the inclusive 
+ * Purpose:      Using the input file length, the chunk length, the
+ *               chunk index, and max index, compute the inclusive
  *               start and end points for the chunk to be produced.
  *
  *               In general, these are:
  *
  *		    chunk_len * chunk_index
  *
- *		 for the start point, and 
+ *		 for the start point, and
  *
  *		    (chunk_len * (chunk_index +1)) - 1
  *
- *		 for the end point.  However, if chunk_index equals 
+ *		 for the end point.  However, if chunk_index equals
  *		 max_chunk_index, the end point is input_file_len - 1.
  *
  *		 Further, if (input_file_len - 1) is less than the noninal
- *               end point of the chunk, set the end point to 
+ *               end point of the chunk, set the end point to
  *               (input_file_len - 1).
  *
- *		 Finally, if (input_file_len - 1) is less than the nominal 
- *		 start point of the chunk, post an error message, and 
+ *		 Finally, if (input_file_len - 1) is less than the nominal
+ *		 start point of the chunk, post an error message, and
  *               return FALSE.
  *
  * Return:       TRUE is successful, and FALSE if an error is detected.
- *
- * Changes:	 none.
  *
  *-------------------------------------------------------------------------
  */
@@ -608,20 +604,20 @@ compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr)
    off_t chunk_end;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
 
    chunk_start = (off_t)(vars_ptr->chunk_index * vars_ptr->chunk_len);
-   chunk_end = 
+   chunk_end =
       (off_t)(((vars_ptr->chunk_index + 1) * vars_ptr->chunk_len) - 1);
 
    assert(chunk_start < chunk_end);
 
-   if ( chunk_start > vars_ptr->input_file_len - 1 ) 
+   if ( chunk_start > vars_ptr->input_file_len - 1 )
    {
-      post_err_mssg("chunk is empty.");
       proceed = FALSE;
+
+      fprintf(stderr, "ERROR: chunk is empty.\n\n");
    }
-   else 
+   else
    {
       if ( ( vars_ptr->chunk_index == vars_ptr->max_chunk_index ) ||
            ( chunk_end >= vars_ptr->input_file_len ) )
@@ -638,7 +634,7 @@ compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr)
       {
          off_t nominal_chunk_len;
 
-         nominal_chunk_len = vars_ptr->nominal_chunk_end - 
+         nominal_chunk_len = vars_ptr->nominal_chunk_end -
                              vars_ptr->nominal_chunk_start + 1;
 
          fprintf(stdout, "nominal chunk start point = %lld\n",
@@ -653,7 +649,7 @@ compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr)
       {
          proceed = FALSE;
 
-         fprintf(stderr, 
+         fprintf(stderr,
                  "\nERROR: Nominal chunk length may not be less than %llu.\n",
                  (unsigned long long)(4 * MAX_SEQUENCE_LEN));
          fprintf(stderr, "      chunk index = %lld\n", vars_ptr->chunk_index);
@@ -663,7 +659,7 @@ compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr)
                  (unsigned long long)(vars_ptr->nominal_chunk_end));
          fprintf(stderr, "	nominal chunk length = %lld\n",
                  (unsigned long long)(chunk_end - chunk_start + 1));
-         fprintf(stderr, 
+         fprintf(stderr,
             "Please revise chunk size and/or max chunk index and rerun.\n\n");
       }
    }
@@ -678,7 +674,7 @@ compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr)
  *
  * Purpose:     Each sequence must consist of four lines -- the "@" line,
  *		the raw sequence line, the "+" plus line, and the quality
- *		line.  Assuming the given offset for the first "@" line 
+ *		line.  Assuming the given offset for the first "@" line
  *		in the line map, count the number of contradictions between
  *		the assumed offset and the id flags set for each line.
  *		
@@ -686,14 +682,12 @@ compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr)
  *
  * Return:      TRUE if successful, and FALSE otherwise.
  *
- * Changes:     none.
- *
  *-------------------------------------------------------------------------
  */
 static void
-count_assignment_errors(int offset, 
-                        struct line_header line_map[], 
-                        int line_count, 
+count_assignment_errors(int offset,
+                        struct line_header line_map[],
+                        int line_count,
                         int * err_count_ptr)
 {
    int i;
@@ -764,14 +758,11 @@ count_assignment_errors(int offset,
 /*-------------------------------------------------------------------------
  * Function:    name_match()
  *
- * Purpose:	compare the names of two sequences to see if they are
- *              corresponding bases on a chromosone pair, according to
- *              the convention specified with the -n option.
+ * Purpose:	compare the ids / names of two reads to see if they comprise
+ *              a single sample, according to the naming convention specified
+ *              with the -n option.
  *
  * Return:      TRUE if the names match, FALSE if not
- *
- * Changes:	TO DO: do a more flexible pattern match rather than
- *              searching for a single character delimiter in the name.
  *
  *-------------------------------------------------------------------------
  */
@@ -812,24 +803,22 @@ static int name_match(struct vc_vars * vars_ptr, char *name1, char *name2)
 /*-------------------------------------------------------------------------
  * Function:    dry_run()
  *
- * Purpose:     Find the nominal and actual start and end points of 
- *		all chunks, and display these values if verbosity > 0.  
- *              If verbosity is greater than 1, also display the reads 
- *              just before and just after the end points.  
+ * Purpose:     Find the nominal and actual start and end points of
+ *		all chunks, and display these values if verbosity > 0.
+ *              If verbosity is greater than 1, also display the reads
+ *              just before and just after the end points.
  *
- *		Note that this function is somewhat memory intensive, and 
- *		is included primarily to support testing -- both of the 
+ *		Note that this function is somewhat memory intensive, and
+ *		is included primarily to support testing -- both of the
  *		code itself, and of chunks size and number selections.
  *
- *		As a result of these priorities, this function is a bit 
- *		inefficient, as the point is to calculate each of the 
- *		end points just the way they would be calculated for 
- *		each chunk in actual application.  Thus the endpoints 
+ *		As a result of these priorities, this function is a bit
+ *		inefficient, as the point is to calculate each of the
+ *		end points just the way they would be calculated for
+ *		each chunk in actual application.  Thus the endpoints
  *		are calculated twice for each boundary between chunks.
  *
  * Return:      TRUE if successful, and FALSE otherwise.
- *
- * Changes:	none.
  *
  *-------------------------------------------------------------------------
  */
@@ -842,16 +831,16 @@ dry_run(struct vc_vars * vars_ptr)
    struct dry_run_chunk_record * drc_array = NULL;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
 
    /* allocate and initialize the array of chunk records */
    drc_array = malloc((size_t)(vars_ptr->max_chunk_index + 1) *
                       sizeof(struct dry_run_chunk_record));
 
-   if ( drc_array == NULL ) 
+   if ( drc_array == NULL )
    {
       proceed = FALSE;
-      post_err_mssg("malloc of drc_array failed.");
+
+      fprintf(stderr, "ERROR: malloc of drc_array failed.\n\n");
    }
    else
    {
@@ -913,9 +902,9 @@ dry_run(struct vc_vars * vars_ptr)
          {
             drc_array[i].first_lines[j] = vars_ptr->first_lines[j];
             drc_array[i].last_lines[j] = vars_ptr->last_lines[j];
-            drc_array[i].first_lines_offsets[j] = 
+            drc_array[i].first_lines_offsets[j] =
                   vars_ptr->first_lines_offsets[j];
-            drc_array[i].last_lines_offsets[j] = 
+            drc_array[i].last_lines_offsets[j] =
                   vars_ptr->last_lines_offsets[j];
          }
       }
@@ -968,8 +957,6 @@ dry_run(struct vc_vars * vars_ptr)
  *
  * Return:      void
  *
- * Changes:     none.
- *
  *-------------------------------------------------------------------------
  */
 static void
@@ -985,12 +972,11 @@ dry_run__dump_chunk_boundaries(struct dry_run_chunk_record * drc_array,
 
    assert(drc_array != NULL);
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
 
    fprintf(stdout, "\nChunk Boundary Table for the file \"%s\":\n\n",
            vars_ptr->input_file_name);
 
-   fprintf(stdout, "Input file length = %lld\n\n", 
+   fprintf(stdout, "Input file length = %lld\n\n",
            (unsigned long long)(vars_ptr->input_file_len));
 
    fprintf(stdout, "%s\n%s\n%s\n", hdr_0, hdr_1, divider);
@@ -1007,9 +993,9 @@ dry_run__dump_chunk_boundaries(struct dry_run_chunk_record * drc_array,
 
    fprintf(stdout, "%s\n\n", divider);
 
-   if ( vars_ptr->verbosity >= 2 ) 
+   if ( vars_ptr->verbosity >= 2 )
    {
-      char * hdr_2 = 
+      char * hdr_2 =
         "Displaying sequences just before and after each chunk boundary.";
       char * hdr_3 =
         "The integer at the beginning of each line is its offset in the file.";
@@ -1025,25 +1011,26 @@ dry_run__dump_chunk_boundaries(struct dry_run_chunk_record * drc_array,
 
          for ( j = 0; j < 4; j++ )
          {
-            fprintf(stdout, "%12lld  %s\n", 
+            fprintf(stdout, "%12lld  %s\n",
                     (unsigned long long)drc_array[i].last_lines_offsets[j],
                     drc_array[i].last_lines[j]);
          }
 
-         fprintf(stdout, 
-                 "========= Chunk %d / %d Boundary (%lld/%lld) =========\n", 
-                 i, i + 1, (unsigned long long)(drc_array[i].actual_chunk_end),                 (unsigned long long)(drc_array[i+1].actual_chunk_start));
+         fprintf(stdout,
+                 "========= Chunk %d / %d Boundary (%lld/%lld) =========\n",
+                 i, i + 1, (unsigned long long)(drc_array[i].actual_chunk_end),
+                 (unsigned long long)(drc_array[i+1].actual_chunk_start));
 
          for ( j = 0; j < 4; j++ )
          {
-            fprintf(stdout, "%12lld  %s\n", 
+            fprintf(stdout, "%12lld  %s\n",
                     (unsigned long long)drc_array[i+1].first_lines_offsets[j],
                     drc_array[i+1].first_lines[j]);
          }
 
          fprintf(stdout, "\n");
       }
-   } 
+   }
 
    return;
 
@@ -1057,15 +1044,12 @@ dry_run__dump_chunk_boundaries(struct dry_run_chunk_record * drc_array,
  *
  * Return:       void
  *
- * Changes:	 none.
- *
  *-------------------------------------------------------------------------
  */
 static void
 dump_params(struct vc_vars * vars_ptr)
 {
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
 
    fprintf(stdout, "\n\nParameters:\n\n");
    fprintf(stdout, "   dry_run          = %d\n", vars_ptr->dry_run);
@@ -1073,11 +1057,11 @@ dump_params(struct vc_vars * vars_ptr)
    fprintf(stdout, "   chunk_index      = %llu\n", vars_ptr->chunk_index);
    fprintf(stdout, "   max_chunk_index  = %llu\n", vars_ptr->max_chunk_index);
    fprintf(stdout, "   name_pattern     = %d\n\n", vars_ptr->name_pattern);
-   fprintf(stdout, "   input_file_name  = \"%s\"\n", 
+   fprintf(stdout, "   input_file_name  = \"%s\"\n",
            vars_ptr->input_file_name);
-   fprintf(stdout, "   output_file_name = \"%s\"\n", 
+   fprintf(stdout, "   output_file_name = \"%s\"\n",
            vars_ptr->output_file_name);
-   fprintf(stdout, "   output_fifo_name = \"%s\"\n", 
+   fprintf(stdout, "   output_fifo_name = \"%s\"\n",
            vars_ptr->output_fifo_name);
    fprintf(stdout, "   verbosity        = %d\n\n", vars_ptr->verbosity);
 
@@ -1093,8 +1077,6 @@ dump_params(struct vc_vars * vars_ptr)
  *
  * Return:      void
  *
- * Changes:	none.
- *
  *-------------------------------------------------------------------------
  */
 static void
@@ -1109,10 +1091,10 @@ dump_line_map(struct line_header line_map[], int line_count)
 
    for ( i = 0; i < line_count; i++ )
    {
-      fprintf(stdout, "Line %d at offset %llu:\n", i, 
+      fprintf(stdout, "Line %d at offset %llu:\n", i,
               (unsigned long long)(line_map[i].offset));
       fprintf(stdout, "	len: %d, flags: 0x%x, body: \"%s\"\n",
-              line_map[i].line_len, line_map[i].id_flags, 
+              line_map[i].line_len, line_map[i].id_flags,
               line_map[i].line_ptr);
    }
 
@@ -1125,12 +1107,10 @@ dump_line_map(struct line_header line_map[], int line_count)
 /*-------------------------------------------------------------------------
  * Function:    dump_seq_map()
  *
- * Purpose:     Write the contents of the supplied sequence map to 
+ * Purpose:     Write the contents of the supplied sequence map to
  *		stdout.
  *
  * Return:      void
- *
- * Changes:	none.
  *
  *-------------------------------------------------------------------------
  */
@@ -1146,7 +1126,7 @@ dump_seq_map(struct seq_header map[], int seq_count)
 
    for ( i = 0; i < seq_count; i++ )
    {
-      fprintf(stdout, "Sequence %d at offset %llu:\n", i, 
+      fprintf(stdout, "Sequence %d at offset %llu:\n", i,
               (unsigned long long)(map[i].offsets[0]));
       fprintf(stdout, "	line 1: len: %d, flags: 0x%x, body: \"%s\"\n",
               map[i].line_len[0], map[i].flags[0], map[i].lines[0]);
@@ -1164,77 +1144,16 @@ dump_seq_map(struct seq_header map[], int seq_count)
 
 
 /*-------------------------------------------------------------------------
- *
- * Function:    get_input_file_len()
- *
- * Purpose:     Stat the input file, load its size (in bytes) into the 
- *              input_file_len field of *vars_ptr, and return TRUE.
- *
- *              If the file does not exist, or if the function fails
- *              for any other reason, *file_len_ptr is undefined, and
- *              the function returns FALSE.
- *
- * Return:      Success: TRUE
- *              Failure: FALSE
- *
- * Changes:     None.
- *
- *-------------------------------------------------------------------------
- */
-
-static int
-get_input_file_len(struct vc_vars * vars_ptr)
-{
-   int proceed = TRUE;
-   int saved_errno;
-   struct stat buf;
-
-   assert(vars_ptr != NULL);
-   assert(strlen(vars_ptr->input_file_name) > 0);
-
-   if ( proceed ) {
-
-      if ( stat(vars_ptr->input_file_name, &buf) != 0 ) 
-      {
-         saved_errno = errno; /* save a copy of errno */
-
-         proceed = FALSE;
-
-         fprintf(stderr, "\nCant't stat input file \"%s\".\n",
-                 vars_ptr->input_file_name);
-         fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
-                 strerror(saved_errno));
-      } else {
-
-         vars_ptr->input_file_len = buf.st_size;
-
-      }
-   }
-
-   if ( ( proceed ) && ( vars_ptr->verbosity >= 3 ) ) 
-   {
-      fprintf(stdout, "input file length = %llu\n", 
-              (unsigned long long)(vars_ptr->input_file_len));
-   }
-
-   return(proceed);
-
-} /* get_input_file_len() */
-
-
-/*-------------------------------------------------------------------------
  * Function:     get_params()
  *
  * Purpose:      Load the user supplied parameters into the supplied
- *		 instance of struct _params.  
+ *		 instance of struct _params.
  *
  *		 If successful, return TRUE.
  *
  *		 On failure, generate an error message, and return FALSE.
  *
  * Return:       TRUE on success, FALSE otherwise.
- *
- * Changes:	 none.
  *
  *-------------------------------------------------------------------------
  */
@@ -1248,22 +1167,13 @@ get_params(int argc,
    int have_chunk_index = FALSE;
    int have_max_chunk_index = FALSE;
    int opt;
-   int proceed = TRUE; 
    unsigned long long multiplier;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
 
-   if ( argc < 5 ) 
+   while ( (opt = getopt(argc, argv, "ds:i:m:n:f:p:v?")) != -1 )
    {
-      post_syntax_err("too few arguments.");
-      proceed = FALSE;
-   }
-
-   while ( ( proceed ) &&
-           ( (opt = getopt(argc, argv, "ds:i:m:n:f:p:v?")) != -1 ) )
-   {
-      switch ( opt ) 
+      switch ( opt )
       {
          case 'd':
             vars_ptr->dry_run = TRUE;
@@ -1277,14 +1187,14 @@ get_params(int argc,
                char_ptr++;
             }
 
-            if ( char_ptr == optarg ) 
+            if ( char_ptr == optarg )
             {
-               post_syntax_err(
-                  "Chunk size must be specified with an integer.");
-               proceed = FALSE;
+               fprintf(stderr,
+                 "\nSYNTAX ERROR: Chunk size must be specified with an integer.\n\n");
+               return FALSE;
             }
 
-            if ( ( proceed ) && ( *char_ptr != '\0' ) )
+            if ( *char_ptr != '\0' )
             {
                switch ( *char_ptr )
                {
@@ -1301,16 +1211,17 @@ get_params(int argc,
                      break;
 
                   default:
-                     post_syntax_err(
-                        "chunk size suffix must be either 'k', 'm', or 'g'.");
-                     proceed = FALSE;
+                     fprintf(stderr,
+                       "\nSYNTAX ERROR: chunk size suffix must be either 'k', 'm', or 'g'.\n\n");
+                     return FALSE;
                      break;
                }
 
-               if ( ( proceed ) && ( *(char_ptr+1) != '\0' ) )
+               if ( *(char_ptr+1) != '\0' )
                {
-                  post_syntax_err("Extra characters after chunk size suffix.");
-                  proceed = FALSE;
+                  fprintf(stderr,
+                    "\nSYNTAX ERROR: Extra characters after chunk size suffix.\n\n");
+                  return FALSE;
                }
             }
             else
@@ -1318,33 +1229,27 @@ get_params(int argc,
                multiplier = 1024 * 1024;
             }
 
-            if ( proceed ) /* convert string to integer */
+            /* convert string to integer */
+            errno = 0;
+            vars_ptr->chunk_len = strtoull(optarg, NULL, 10);
+            assert(errno == 0);
+            if ( vars_ptr->chunk_len <= 0 )
             {
-               errno = 0;
-               vars_ptr->chunk_len = strtoull(optarg, NULL, 10);
-               assert(errno == 0);
-               if ( vars_ptr->chunk_len <= 0 )
-               {
-                  post_syntax_err("Chunk size must be greater than 0.");
-                  proceed = FALSE;
-               }
+               fprintf(stderr,
+                 "\nSYNTAX ERROR: Chunk size must be greater than 0.\n\n");
+               return FALSE;
             }
 
-            if ( proceed ) 
-            {
-               /* apply multiplier -- should have overflow check here */
-               vars_ptr->chunk_len *= multiplier;
+            /* apply multiplier -- should have overflow check here */
+            vars_ptr->chunk_len *= multiplier;
 
-               if ( vars_ptr->chunk_len < (5 * MAX_SEQUENCE_LEN) )
-               {
-                  post_syntax_err("Chunk size must be greater 50 KB.");
-                  proceed = FALSE;
-               }
-               else
-               {
-                  have_chunk_size = TRUE;
-               }
+            if ( vars_ptr->chunk_len < (5 * MAX_SEQUENCE_LEN) )
+            {
+               fprintf(stderr,
+                 "\nSYNTAX ERROR: Chunk size must be greater 50 KB.\n\n");
+               return FALSE;
             }
+            have_chunk_size = TRUE;
             break;
 
          case 'i':
@@ -1354,9 +1259,9 @@ get_params(int argc,
             {
                if ( ! isdigit(*char_ptr) )
                {
-                  post_syntax_err(
-                        "chunk index must be an unsigned decimal integer.");
-                  proceed = FALSE;
+                  fprintf(stderr,
+                    "\nSYNTAX ERROR: Chunk index must be an unsigned decimal integer.\n\n");
+                  return FALSE;
                }
                char_ptr++;
             }
@@ -1373,9 +1278,9 @@ get_params(int argc,
             {
                if ( ! isdigit(*char_ptr) )
                {
-                  post_syntax_err(
-                      "max chunk index must be an unsigned decimal integer.");
-                  proceed = FALSE;
+                  fprintf(stderr,
+                      "SYNTAX ERROR: Max chunk index must be an unsigned decimal integer.\n\n");
+                  return FALSE;
                }
                char_ptr++;
             }
@@ -1396,33 +1301,29 @@ get_params(int argc,
                 vars_ptr->name_pattern = np_illumina;
             }
             else {
-               proceed = FALSE;
+               fprintf(stderr, "\nSYNTAX ERROR: Unknown name pattern / vendor name\n\n");
+               return FALSE;
             }
             errno = 0;
             break;
 
          case 'f':
-            if ( strlen(optarg) >= MAX_PATH_LEN ) 
+            if ( strlen(optarg) >= MAX_PATH_LEN )
             {
-               post_syntax_err("output file path too long.");
-               proceed = FALSE;
+               fprintf(stderr, "\nSYNTAX ERROR: Output file path too long.\n\n");
+               return FALSE;
             }
-            else
-            {
-               strcpy(vars_ptr->output_file_name, optarg);
-            }
+            strcpy(vars_ptr->output_file_name, optarg);
             break;
 
          case 'p':
-            if ( strlen(optarg) >= MAX_PATH_LEN ) 
+            if ( strlen(optarg) >= MAX_PATH_LEN )
             {
-               post_syntax_err("output FIFO (AKA named pipe) path too long.");
-               proceed = FALSE;
+               fprintf(stderr,
+                 "\nSYNTAX ERROR: Output FIFO (AKA named pipe) path too long.\n\n");
+               return FALSE;
             }
-            else
-            {
-               strcpy(vars_ptr->output_fifo_name, optarg);
-            }
+            strcpy(vars_ptr->output_fifo_name, optarg);
             break;
 
          case 'v':
@@ -1430,9 +1331,8 @@ get_params(int argc,
             break;
 
          case '?':
-            proceed = FALSE;
             usage();
-            break;
+            return FALSE;
 
          default: /* this should be unreachable */
             assert(0);
@@ -1440,73 +1340,135 @@ get_params(int argc,
       }
    }
 
-   if ( proceed ) 
+   if ( ( ! have_chunk_size ) && ( ! have_max_chunk_index ) )
    {
-      if ( ! have_chunk_size ) 
-      {
-         post_syntax_err("Chunk size not specified.");
-         proceed = FALSE;
-      } 
-      else if ( ( ! have_chunk_index ) && ( ! vars_ptr->dry_run ) ) 
-      {
-         post_syntax_err("Chunk index not specified.");
-         proceed = FALSE;
+      fprintf(stderr, "\nSYNTAX ERROR: Neither chunk size nor max chunk index specified.\n\n");
+      return FALSE;
+   }
+   if ( ! have_chunk_index )
+   {
+      if ( ! vars_ptr->dry_run ) {
+         fprintf(stderr, "\nSYNTAX ERROR: Chunk index not specified.\n\n");
+         return FALSE;
       }
-      else if ( ! have_max_chunk_index )
-      {
-         post_syntax_err("Maximum chunk index not specified.");
-         proceed = FALSE;
-      }
+      vars_ptr->chunk_index = 0;  // to avoid asserts
    }
-
-   if ( ( proceed ) && ( vars_ptr->chunk_index > vars_ptr->max_chunk_index ) )
+   if ( ( strlen(vars_ptr->output_file_name) > 0 )
+      && ( strlen(vars_ptr->output_fifo_name) > 0 ) )
    {
-      post_syntax_err("chunk index may not exceed max chunk index.");
-      proceed = FALSE;
+      fprintf(stderr, "\nSYNTAX ERROR: Both output file and output fifo defined?\n\n");
+      return FALSE;
    }
-
-   if ( ( proceed ) && ( strlen(vars_ptr->output_file_name) > 0 ) &&
-        ( strlen(vars_ptr->output_fifo_name) > 0 ) )
+   if ( optind < (argc - 1) )
    {
-      post_syntax_err("both output file and output fifo defined?");
-      proceed = FALSE;
+      fprintf(stderr, "\nSYNTAX ERROR: Input file must be last arg.\n\n");
+      return FALSE;
    }
-
-   if ( ( proceed ) && ( optind >= argc) )
+   if ( optind >= argc )
    {
-      post_syntax_err("missing argument after option?");
-      proceed = FALSE;
+      assert(0);
    }
 
-   if ( ( proceed ) && ( optind < (argc - 1)) )
+   assert(argv[optind] != NULL);
+   if ( strlen(argv[optind]) >= MAX_PATH_LEN )
    {
-      post_syntax_err("excess parameters?");
-      proceed = FALSE;
+      fprintf(stderr, "\nSYNTAX ERROR: Input file path too long.\n\n");
+      return FALSE;
    }
-
-   if ( proceed )
+   if ( strlen(argv[optind]) == 0 )
    {
-      assert(argv[optind] != NULL);
-
-      if ( strlen(argv[optind]) >= MAX_PATH_LEN ) 
-      {
-         post_syntax_err("input file path too long.");
-         proceed = FALSE;
-      }
-      else if ( strlen(argv[optind]) == 0 )
-      {
-         post_syntax_err("zero length input file path.");
-         proceed = FALSE;
-      }
-      else
-      {
-         strcpy(vars_ptr->input_file_name, argv[optind]);
-      }
+      fprintf(stderr, "\nSYNTAX ERROR: Zero length input file path.\n\n");
+      return FALSE;
    }
+   strcpy(vars_ptr->input_file_name, argv[optind]);
 
-   return(proceed);
+   return TRUE;
 
 } /* get_params() */
+
+
+/*-------------------------------------------------------------------------
+ *
+ * Function:    open_input_file()
+ *
+ * Purpose:     Stat the input file, load its size (in bytes) and run some
+ *              checks, and calculate the number of chunks or the chunk
+ *              size if only one was specified.  Then open the input file.
+ *
+ * Return:      Success: TRUE
+ *              Failure: FALSE
+ *
+ *-------------------------------------------------------------------------
+ */
+
+static int open_input_file(struct vc_vars * vars_ptr)
+{
+   struct stat buf;
+
+   if ( stat(vars_ptr->input_file_name, &buf) != 0 )
+   {
+      fprintf(stderr, "ERROR: Can't stat input file \"%s\".\n",
+        vars_ptr->input_file_name);
+      fprintf(stderr, "errno = %d -- \"%s\"\n", errno, strerror(errno));
+      return FALSE;
+   }
+   vars_ptr->input_file_len = buf.st_size;
+
+   if ( vars_ptr->max_chunk_index == (unsigned long long)(-1) )
+   {
+      assert(vars_ptr->chunk_len > 0);
+      vars_ptr->max_chunk_index =
+        (vars_ptr->input_file_len - 1) / vars_ptr->chunk_len;
+   }
+   else if ( vars_ptr->chunk_len == 0 )
+   {
+      assert(vars_ptr->max_chunk_index != (unsigned long long)(-1));
+
+      //
+      // do this division this way to avoid overflow
+      // we don't really need the if-clause
+      //
+      vars_ptr->chunk_len =
+        vars_ptr->input_file_len / (vars_ptr->max_chunk_index + 1);
+      if ( (vars_ptr->max_chunk_index + 1) * vars_ptr->chunk_len
+        < vars_ptr->input_file_len )
+      {
+         vars_ptr->chunk_len++;
+         assert((vars_ptr->max_chunk_index + 1) * vars_ptr->chunk_len
+           >= vars_ptr->input_file_len);
+      }
+   }
+
+   if ( vars_ptr->chunk_len > (unsigned long long)(vars_ptr->input_file_len) )
+   {
+      fprintf(stderr, "ERROR: chunk size greater than input file size.\n");
+      return FALSE;
+   }
+   if ( ( vars_ptr->chunk_index > vars_ptr->max_chunk_index ) )
+   {
+      fprintf(stderr,
+        "\nSYNTAX ERROR: Chunk index may not exceed max chunk index.\n\n");
+      return FALSE;
+   }
+#if 0
+   if ( ((vars_ptr->chunk_len * vars_ptr->max_chunk_index)
+     + (5 * MAX_SEQUENCE_LEN)) >= vars_ptr->input_file_len )
+   {
+      fprintf(stderr, "ERROR: Last chunk too small.  Decrease max chunk index?\n");
+      return FALSE;
+   }
+#endif
+   if ( ( vars_ptr->input_fd =
+     open(vars_ptr->input_file_name, O_RDONLY, S_IRUSR)) < 0 )
+   {
+      fprintf(stderr, "\nERROR: Can't open input file \"%s\".\n", vars_ptr->input_file_name);
+      fprintf(stderr, "errno = %d -- \"%s\"\n", errno, strerror(errno));
+      return FALSE;
+   }
+
+   return TRUE;
+
+} /* open_input_file */
 
 
 /*-------------------------------------------------------------------------
@@ -1524,8 +1486,6 @@ get_params(int argc,
  *
  * Return:      Success: TRUE
  *              Failure: FALSE
- *
- * Changes:     none.
  *
  *-------------------------------------------------------------------------
  */
@@ -1545,7 +1505,6 @@ load_buf_from_file(off_t offset,
    off_t seek_result;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert(vars_ptr->input_fd >= 0);
    assert(vars_ptr->input_file_len > 0);
    assert(offset < vars_ptr->input_file_len);
@@ -1561,7 +1520,7 @@ load_buf_from_file(off_t offset,
 
          proceed = FALSE;
 
-         fprintf(stderr, "\nCant't seek to %llu in input file.\n", offset);
+         fprintf(stderr, "\nERROR: Can't seek to %llu in input file.\n", offset);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
       }
@@ -1580,13 +1539,13 @@ load_buf_from_file(off_t offset,
       {
          proceed = FALSE;
 
-         fprintf(stderr, 
-                "\nCant't read from in input file on itteration %d.\n", 
+         fprintf(stderr,
+                "\nERROR: Can't read from in input file on itteration %d.\n",
                 read_itteration);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
       }
-      else 
+      else
       {
          assert(result <= local_buf_len);
 
@@ -1598,7 +1557,7 @@ load_buf_from_file(off_t offset,
       }
    }
 
-   if ( proceed ) 
+   if ( proceed )
       assert(bytes_read == (ssize_t)buf_len);
 
    return(proceed);
@@ -1613,9 +1572,9 @@ load_buf_from_file(off_t offset,
  *		the buffer of the first character of every FASTQ sequence
  *		that has its first character in the buffer.
  *
- *		Unfortunately, the structure of a FASTQ file was not 
- *		designed to make this easy, and the documentation on 
- *		on the FASTQ file format is not very good.  
+ *		Unfortunately, the structure of a FASTQ file was not
+ *		designed to make this easy, and the documentation on
+ *		on the FASTQ file format is not very good.
  *
  *		I have extracted the following BNF for FASTQ:
  *
@@ -1631,7 +1590,7 @@ load_buf_from_file(off_t offset,
  *
  *		<line 4> ::= <quality values> <EOL>
  *
- *		<raw_sequence_char> ::= 
+ *		<raw_sequence_char> ::=
  *                ('A' | 'a' | 'C' | 'c' | 'G' | 'g' | 'N' | 'n' | 'T' | 't')+
  *
  *		<quality_values> ::= <quality char>+
@@ -1644,33 +1603,31 @@ load_buf_from_file(off_t offset,
  *			[]  indicates option
  *		        ()  indicates grouping
  *			*   closure
- *			+   positive closure 
+ *			+   positive closure
  *
  *		Unfortunately, I haven't been able to find any restrictions
- *		on the <seq_id> or the <seq_desc> -- other than to observe 
+ *		on the <seq_id> or the <seq_desc> -- other than to observe
  *		that white space seems to be allowed, as do all printing
- *		characters 
+ *		characters
  *
  *		Note the following semantic requirements:
  *
- *		In any given sequence, the strings replacing 
+ *		In any given sequence, the strings replacing
  *		the <raw_sequence_data> and <quality_values> non
- *		terminals must have the same length, and may contain 
+ *		terminals must have the same length, and may contain
  *		no white space.
  *
- *		If <seq_id> appears in <line 3>, then the strings 
+ *		If <seq_id> appears in <line 3>, then the strings
  *		replacing the <seq_id> in <line 1> and <line 3> must
  *		be identical.
  *
  * Return:      TRUE if successful, and FALSE otherwise.
  *
- * Changes      none.
- *
  *-------------------------------------------------------------------------
  */
 static int
 map_test_buf(off_t test_buf_offset,
-             char test_buf[], 
+             char test_buf[],
              int test_buf_len,
              struct seq_header map[],
              int map_len,
@@ -1687,8 +1644,8 @@ map_test_buf(off_t test_buf_offset,
    int proceed = TRUE;
    struct line_header line_map[2 * MAX_SEQUENCE_LEN];
 
-   proceed = map_test_buf_lines(test_buf_offset, 
-                                test_buf, 
+   proceed = map_test_buf_lines(test_buf_offset,
+                                test_buf,
                                 test_buf_len,
                                 line_map,
                                 2 * MAX_SEQUENCE_LEN,
@@ -1696,8 +1653,8 @@ map_test_buf(off_t test_buf_offset,
                                 vars_ptr);
 
    /* At this point, we have broken the test buffer into lines, scanned
-    * each line, and marked it with flags indicating the possible type 
-    * of FASTQ line it could be.  
+    * each line, and marked it with flags indicating the possible type
+    * of FASTQ line it could be.
     *
     * Scan the line map, and look for lines that can't appear in a FASTQ
     * file.  If we find any, post an error message and quit.
@@ -1724,7 +1681,7 @@ map_test_buf(off_t test_buf_offset,
       {
          proceed = FALSE;
 
-         fprintf(stderr, 
+         fprintf(stderr,
                 "\nERROR: Encountered invalid line(s) in input file.\n");
       }
       else
@@ -1734,13 +1691,13 @@ map_test_buf(off_t test_buf_offset,
       }
    }
 
-   /* If we get this far without errors, we know that all the lines in 
+   /* If we get this far without errors, we know that all the lines in
     * the line map are lines that could conceiveably appear in a FASTQ
     * file.  Must now assemble a sequence map from the line map.
     *
-    * Since the lines must appear in a well defined order, there are 
-    * only four possible assignments.  We will examine them all, and 
-    * compute how many errors each one produces.  
+    * Since the lines must appear in a well defined order, there are
+    * only four possible assignments.  We will examine them all, and
+    * compute how many errors each one produces.
     */
 
    if ( proceed )
@@ -1750,7 +1707,7 @@ map_test_buf(off_t test_buf_offset,
 
       for ( i = 0; i < 4; i++ )
       {
-         count_assignment_errors(i, line_map, line_count, 
+         count_assignment_errors(i, line_map, line_count,
                                  &(assignment_errors[i]));
 
          if ( assignment_errors[i] < min_errs )
@@ -1762,21 +1719,21 @@ map_test_buf(off_t test_buf_offset,
 
       assert((best_offset >= 0) && ( best_offset <= 3));
 
-      /* At some point, we may wish to allow error tollerance here. But 
-       * for now, scream and die if there is no assignememtn without 
+      /* At some point, we may wish to allow error tollerance here. But
+       * for now, scream and die if there is no assignememtn without
        * errors.
        */
 
-      if ( min_errs > 0 ) 
+      if ( min_errs > 0 )
       {
          proceed = FALSE;
 
-         fprintf(stderr, 
+         fprintf(stderr,
                  "\n\nERROR: Unable to construct error free sequence map.\n");
          fprintf(stderr, "	Best offset = %d, Best err count = %d.\n\n",
                  best_offset, min_errs);
 
-         if ( vars_ptr->verbosity >= 3 ) 
+         if ( vars_ptr->verbosity >= 3 )
          {
             dump_line_map(line_map, line_count);
          }
@@ -1785,9 +1742,9 @@ map_test_buf(off_t test_buf_offset,
 
    if ( proceed ) /* verify that the best offset is unique */
    {
-      /* if it turns out that the best offset isn't unique, we have 
+      /* if it turns out that the best offset isn't unique, we have
        * ways of disambiguating the situation.  However, for now
-       * just test to see if the situation occurs.  
+       * just test to see if the situation occurs.
        */
       for ( i = 0; i < 4 ; i++ )
       {
@@ -1840,33 +1797,31 @@ map_test_buf(off_t test_buf_offset,
 /*-------------------------------------------------------------------------
  * Function:    map_test_buf_lines()
  *
- * Purpose:     Scan the test buffer, and replace all new lines with 
- *		null characters.  Construct an index of all lines that 
- *		start in the test buffer in the supplied array of 
+ * Purpose:     Scan the test buffer, and replace all new lines with
+ *		null characters.  Construct an index of all lines that
+ *		start in the test buffer in the supplied array of
  *		struct line_header.  In passing, examine characters that
  *		appear in the lines, and set flags indicating possible
  *		identifications.
  *
  * Return:       TRUE if successful, and FALSE otherwise.
  *
- * Changes:	 none.
- *
  *-------------------------------------------------------------------------
  */
 static int
 map_test_buf_lines(off_t test_buf_offset,
-                   char test_buf[], 
+                   char test_buf[],
                    int test_buf_len,
                    struct line_header line_map[],
                    int map_len,
                    int *line_count_ptr,
                    struct vc_vars * vars_ptr)
 {
-   enum scan_state 
-   { 
-      finding_first_line, 
-      starting_line, 
-      scanning_line, 
+   enum scan_state
+   {
+      finding_first_line,
+      starting_line,
+      scanning_line,
       nulling_new_line
    } state = finding_first_line;
    int could_be_line_1;
@@ -1884,7 +1839,6 @@ map_test_buf_lines(off_t test_buf_offset,
    assert(map_len > 0);
    assert(line_count_ptr != NULL);
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
 
    if ( ( test_buf[i] == '\r' ) || ( test_buf[i] == '\n' ) )
    {
@@ -1907,7 +1861,7 @@ map_test_buf_lines(off_t test_buf_offset,
 
          case starting_line:
             assert(j < map_len);
-            
+
             /* initialze the map entry for this line.  Setting line_len
              * to zero below is not a typo, as we are going to change state
              * to scanning_line and fall through to that state.
@@ -1939,8 +1893,8 @@ map_test_buf_lines(off_t test_buf_offset,
 
             could_be_line_4 = TRUE;
 
-            /* set state to case scanning_line and fall through 
-             * to that state 
+            /* set state to case scanning_line and fall through
+             * to that state
              */
             state = scanning_line;
 
@@ -1949,12 +1903,12 @@ map_test_buf_lines(off_t test_buf_offset,
          case scanning_line:
             if ( ( test_buf[i] == '\r' ) || ( test_buf[i] == '\n' ) )
             {
-               /* We have found the end of the line -- finish setting 
+               /* We have found the end of the line -- finish setting
                 * up the line map entry, increment j, and line_count,
                 * and set state to nulling_new_line.
                 *
                 * Note that we must not increment i, as i must be the
-                * index of the initial new line character on entry to 
+                * index of the initial new line character on entry to
                 * the nulling_new_line state.
                 */
                assert(j == line_count);
@@ -1985,7 +1939,7 @@ map_test_buf_lines(off_t test_buf_offset,
                /* increment i to get us out of the while loop */
                i++;
             }
-            else 
+            else
             {
                /* update possible line id flags */
                could_be_line_2 = could_be_line_2 && IS_SEQ_CHAR(test_buf[i]);
@@ -2006,7 +1960,7 @@ map_test_buf_lines(off_t test_buf_offset,
              * lines ("\r").
              *
              * Note that in a FASTQ file, we can have no empty lines,
-             * so flag an error if we don't see one of the above 
+             * so flag an error if we don't see one of the above
              * sequences.
              */
             assert((test_buf[i] == '\r') || (test_buf[i] == '\n'));
@@ -2014,47 +1968,47 @@ map_test_buf_lines(off_t test_buf_offset,
             if ( test_buf[i] == '\n' )
             {
                /* Unix new line -- null this character and increment i.
-                * Will verify that the next character is printable 
+                * Will verify that the next character is printable
                 * of off the buffer later.
                 */
                test_buf[i] = '\0';
                i++;
-            } 
+            }
             else if ( test_buf[i] == '\r' )
             {
-               /* should be either an old Macintosh new line or an 
+               /* should be either an old Macintosh new line or an
                 * MSDOS newline.
                 */
                if ( i + 1 >= test_buf_len )
                {
-                  /* it doesn't matter as we are at the end of the 
+                  /* it doesn't matter as we are at the end of the
                    * buffer -- just null the character and increment i
                    */
                   test_buf[i] = '\0';
                   i++;
-               } 
+               }
                else if ( test_buf[i] == '\n' )
                {
                   /* It is an MSDOS new line -- null both characters
-                   * and increment i by 2.  Will verify that the next 
+                   * and increment i by 2.  Will verify that the next
                    * character is printable or off the buffer later.
                    */
                  test_buf[i] = '\0';
                  test_buf[i+1] = '\0';
                  i += 2;
                }
-               else 
+               else
                {
                   /* it is either an old Macintosh new line or an error.
-                   * null the character and check for error later. 
+                   * null the character and check for error later.
                    */
                   test_buf[i] = '\0';
                   i++;
                }
             }
-               
+
             /* At this point, we have nulled the new line character(s),
-             * and must verify that either we have reached the end of 
+             * and must verify that either we have reached the end of
              * the buffer, or that the next character is printable.
              * In either case, we can set state to starting_line.
              *
@@ -2069,8 +2023,8 @@ map_test_buf_lines(off_t test_buf_offset,
             {
                proceed = FALSE;
 
-               fprintf(stderr, 
-                  "\nIll formed EOL at offset %llu in input file \"%s\".\n",
+               fprintf(stderr,
+                  "\nERROR: Ill formed EOL at offset %llu in input file \"%s\".\n",
                   (test_buf_offset + i - 1), vars_ptr->input_file_name);
             }
             break;
@@ -2102,110 +2056,11 @@ map_test_buf_lines(off_t test_buf_offset,
 
 
 /*-------------------------------------------------------------------------
- * Function:     open_input_file()
- *
- * Purpose:      Attempt to open the input file.  If successful, return
- *               TRUE.  Otherwise, issue an error message, and return
- *               FALSE.
- *
- *		 Note that we use file descriptor based I/O here because
- *		 we are working with large files, and thus may have to 
- *		 seek to locations that cannot be represented with a long.
- *
- * Return:       TRUE if successful, and FALSE otherwise.
- *
- * Changes:	 none.
- *
- *-------------------------------------------------------------------------
- */
-static int
-open_input_file(struct vc_vars * vars_ptr)
-{
-   int proceed = TRUE;
-   int fd;
-   int saved_errno;
-
-   assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
-   assert(strlen(vars_ptr->input_file_name) > 0);
-   assert(vars_ptr->input_fd == -1);
-
-   errno = 0;
-   fd = open(vars_ptr->input_file_name, O_RDONLY, S_IRUSR);
-   saved_errno = errno;
-
-   if ( fd == -1 )
-   {
-      proceed = FALSE;
-
-      fprintf(stderr, "\nCant't open input file \"%s\".\n",
-              vars_ptr->input_file_name);
-      fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
-              strerror(saved_errno));
-   }
-   else
-   {
-      vars_ptr->input_fd = fd;
-   }
-
-   return(proceed);
-
-} /* open_input_file() */
-
-
-/*-------------------------------------------------------------------------
- * Function:     post_err_mssg()
- *
- * Purpose:      Post the supplied error message, and return.
- *
- * Return:       void
- *
- * Changes:	 none.
- *
- *-------------------------------------------------------------------------
- */
-static void
-post_err_mssg(char * err_msg)
-{
-   assert(err_msg != NULL);
-
-   fprintf(stderr, "\nERROR: %s\n\n", err_msg);
-
-   return;
-
-} /* post_err_mssg() */
-
-
-/*-------------------------------------------------------------------------
- * Function:     post_syntax_err()
- *
- * Purpose:      Post the supplied syntax error message, display the
- *		 usage, and return.
- *
- * Return:       void
- *
- * Changes:	 none.
- *
- *-------------------------------------------------------------------------
- */
-static void
-post_syntax_err(char * err_msg)
-{
-   assert(err_msg != NULL);
-   fprintf(stderr, "\nSYNTAX ERROR: %s\n\n", err_msg);
-   usage();
-
-   return;
-
-} /* post_syntax_err() */
-
-
-/*-------------------------------------------------------------------------
  * Function:    setup_output_fd
  *
  * Purpose:	Setup the file descriptor to be used for output.
  *
- *		If neither vars_ptr->output_file_name nor 
+ *		If neither vars_ptr->output_file_name nor
  *		vars_ptr->output_fifo_name are defined, simply
  *		set vars_ptr->output_fd to STDOUT_FILENO.
  *		
@@ -2216,20 +2071,18 @@ post_syntax_err(char * err_msg)
  *		descriptor of the newly opened file, and return TRUE.
  *		On failure, generate an error message and return FALSE.
  *
- *		If vars_ptr->output_fifo_name is defined, assert that 
+ *		If vars_ptr->output_fifo_name is defined, assert that
  *		vars_ptr->output_file_name is undefined.  Then attempt
  *		to create the fifo -- as it may already exist, do not
- *		flag an error mkfifo() returns EEXIST.  On all other 
+ *		flag an error mkfifo() returns EEXIST.  On all other
  *		errors, generate an error messages and return FALSE.
  *		Assuming no fatal errors in mkfifo(), open the fifo
  *		O_WRONLY.  On failure, generate an error message and
- *		return FALSE.  Otherwise, set vars_ptr->output_fd to 
+ *		return FALSE.  Otherwise, set vars_ptr->output_fd to
  *		the file descriptor associated with the newly opened
  *		FIFO, and return TRUE.
  *
  * Return:      TRUE if successful, and FALSE otherwise.
- *
- * Changes:	none.
  *
  *-------------------------------------------------------------------------
  */
@@ -2242,7 +2095,6 @@ setup_output_fd(struct vc_vars * vars_ptr)
    int saved_errno;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert( ! ( ( strlen(vars_ptr->output_file_name) > 0 ) && \
                ( strlen(vars_ptr->output_fifo_name) > 0 ) ) );
    assert(vars_ptr->output_fd == -1);
@@ -2258,7 +2110,7 @@ setup_output_fd(struct vc_vars * vars_ptr)
       /* send output to a normal file */
 
       errno = 0;
-      fd = open(vars_ptr->output_file_name, 
+      fd = open(vars_ptr->output_file_name,
                 O_WRONLY|O_APPEND|O_CREAT, S_IRUSR|S_IWUSR);
       saved_errno = errno;
 
@@ -2266,7 +2118,7 @@ setup_output_fd(struct vc_vars * vars_ptr)
       {
          proceed = FALSE;
 
-         fprintf(stderr, "\nCant't open output file \"%s\".\n",
+         fprintf(stderr, "\nERROR: Can't open output file \"%s\".\n",
                  vars_ptr->output_file_name);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
@@ -2293,7 +2145,7 @@ setup_output_fd(struct vc_vars * vars_ptr)
       {
          proceed = FALSE;
 
-         fprintf(stderr, "\nCant't create output fifo \"%s\".\n",
+         fprintf(stderr, "\nERROR: Can't create output fifo \"%s\".\n",
                  vars_ptr->output_fifo_name);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
@@ -2309,7 +2161,7 @@ setup_output_fd(struct vc_vars * vars_ptr)
          {
             proceed = FALSE;
 
-            fprintf(stderr, "\nCant't open output fifo \"%s\".\n",
+            fprintf(stderr, "\nERROR: Can't open output fifo \"%s\".\n",
                     vars_ptr->output_fifo_name);
             fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                     strerror(saved_errno));
@@ -2329,26 +2181,24 @@ setup_output_fd(struct vc_vars * vars_ptr)
 /*-------------------------------------------------------------------------
  * Function:    takedown_output_fd()
  *
- * Purpose:     Takedown the output file descriptor.  What has to be 
+ * Purpose:     Takedown the output file descriptor.  What has to be
  *		done depends on its value.
  *
- *		if vars_ptr->output_fd == STDOUT_FILENO just set 
+ *		if vars_ptr->output_fd == STDOUT_FILENO just set
  *		vars_ptr->output_fd = -1, as we don't want to close
  *		stdout.
  *
- *		Any other value of vars_ptr->output_fd indicates that 
- *		it points to either a regular file of a FIFO (AKA 
+ *		Any other value of vars_ptr->output_fd indicates that
+ *		it points to either a regular file of a FIFO (AKA
  *		named pipe).  In either case we must use the close()
- *		system call to close it.  Generate an error 
+ *		system call to close it.  Generate an error
  *		message on failure.
  *
  *		Note that we use file descriptor based I/O here because
- *		we are working with large files, and thus may have to 
+ *		we are working with large files, and thus may have to
  *		seek to locations that cannot be represented with a long.
- * 
- * Return:      TRUE if successful, and FALSE otherwise.
  *
- * Changes:     none.
+ * Return:      TRUE if successful, and FALSE otherwise.
  *
  *-------------------------------------------------------------------------
  */
@@ -2359,7 +2209,6 @@ takedown_output_fd(struct vc_vars * vars_ptr)
    int saved_errno;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert( ! ( ( strlen(vars_ptr->output_file_name) > 0 ) && \
                ( strlen(vars_ptr->output_fifo_name) > 0 ) ) );
    assert(vars_ptr->output_fd != -1);
@@ -2376,7 +2225,7 @@ takedown_output_fd(struct vc_vars * vars_ptr)
 
       if ( result == -1 )
       {
-         fprintf(stderr, "\nCant't close output file \"%s\".\n",
+         fprintf(stderr, "\nERROR: Can't close output file \"%s\".\n",
                  vars_ptr->output_file_name);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
@@ -2392,7 +2241,7 @@ takedown_output_fd(struct vc_vars * vars_ptr)
 
       if ( result == -1 )
       {
-         fprintf(stderr, "\nCant't close output fifo \"%s\".\n",
+         fprintf(stderr, "\nERROR: Can't close output fifo \"%s\".\n",
                  vars_ptr->output_fifo_name);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
@@ -2410,8 +2259,6 @@ takedown_output_fd(struct vc_vars * vars_ptr)
  * Purpose:      Print usage message.
  *
  * Return:       void
- *
- * Changes:	 none.
  *
  *-------------------------------------------------------------------------
  */
@@ -2437,23 +2284,18 @@ usage: vc [OPTIONS] <input FASTQ file>\n\
       -i n               Index of the chunk to extract. \n\
                          Ignored if dry run is specified. \n\
 \n\
-      -m n               Max chunk index. \n\
+      -m n               Max chunk index (#chunks-1). \n\
 \n\
-      -n <patt>          Check chunk boundaries. Do not split chunks\n\
-                         between two sequences which have similar names.\n\
-                         \"Similar\" means that the names are identical\n\
-                         according to the pattern <patt>.  <patt> must \n\
-                         be one of ihe following\n\
-                         \n\
-                         \n\
-                         \n\
-                         \n\
-                         \n\
-                         \n\
-                         This only works if the sequences are in pairs,\n\
-                         appearing consecutively in the input.  It does\n\
-                         work with groups of three or more similarly-named\n\
-                         sequences.\n\
+      -n <name>          Specify the seqence id / name pattern to which a\n\
+                         vendor adheres to. It must be one of the following:\n\
+\n\
+                           \"neat\" or \"/\" ==> The names of a read pair are\n\
+                                                 identical up to a \"/\"\n\
+                                                 (forward slash) character.\n\
+\n\
+                           \"illumina\" or \" \" ==> The names of a read pair\n\
+                                                 are identical up to a \" \"\n\
+                                                 (space) character.\n\
 \n\
       -f <file name>     Name of the file to which to write the chunk.\n\
 \n\
@@ -2485,16 +2327,14 @@ usage: vc [OPTIONS] <input FASTQ file>\n\
  *
  * Function:    write_buf_to_output_fd()
  *
- * Purpose:     Write the contents of the supplied buffer to the file 
- *		descriptor listed in vars_ptr->output_fd.  This may be 
+ * Purpose:     Write the contents of the supplied buffer to the file
+ *		descriptor listed in vars_ptr->output_fd.  This may be
  *		either sdtoud, a regular file, or a FIFO (AKA named pipe).
  *
  *              Return TRUE if completely successful and FALSE otherwise.
  *
  * Return:      Success: TRUE
  *              Failure: FALSE
- *
- * Changes:     none.
  *
  *-------------------------------------------------------------------------
  */
@@ -2512,7 +2352,6 @@ write_buf_to_output_fd(off_t buf_len,
    ssize_t result;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert(vars_ptr->output_fd != -1);
    assert(buf_len > 0);
    assert(buf_ptr != NULL);
@@ -2523,7 +2362,7 @@ write_buf_to_output_fd(off_t buf_len,
    while ( ( proceed ) && ( bytes_written < (ssize_t)buf_len ) )
    {
       errno = 0;
-      result = write(vars_ptr->output_fd, (void *)local_buf_ptr, 
+      result = write(vars_ptr->output_fd, (void *)local_buf_ptr,
                      local_buf_len);
       saved_errno = errno;
 
@@ -2531,13 +2370,13 @@ write_buf_to_output_fd(off_t buf_len,
       {
          proceed = FALSE;
 
-         fprintf(stderr, 
-                "\nCant't write to output fd on itteration %d.\n", 
+         fprintf(stderr,
+                "\nERROR: Can't write to output fd on itteration %d.\n",
                 write_itteration);
          fprintf(stderr, "errno = %d -- \"%s\"\n", saved_errno,
                  strerror(saved_errno));
       }
-      else 
+      else
       {
          assert(result <= local_buf_len);
 
@@ -2549,7 +2388,7 @@ write_buf_to_output_fd(off_t buf_len,
       }
    }
 
-   if ( proceed ) 
+   if ( proceed )
       assert(bytes_written == (ssize_t)buf_len);
 
    return(proceed);
@@ -2560,12 +2399,10 @@ write_buf_to_output_fd(off_t buf_len,
 /*-------------------------------------------------------------------------
  * Function:    write_chunk
  *
- * Purpose:	Load the desired chunk from the input file, and write 
+ * Purpose:	Load the desired chunk from the input file, and write
  *		it to the output specified by vars_ptr->output_fd.
  *
  * Return:      TRUE if successful, and FALSE otherwise.
- *
- * Changes:	none.
  *
  *-------------------------------------------------------------------------
  */
@@ -2581,7 +2418,6 @@ write_chunk(struct vc_vars * vars_ptr)
    off_t bytes_this_read;
 
    assert(vars_ptr != NULL);
-   assert(vars_ptr->magic == VC_VARS_MAGIC);
    assert(vars_ptr->input_fd != -1);
    assert(vars_ptr->output_fd != -1);
 
@@ -2589,14 +2425,15 @@ write_chunk(struct vc_vars * vars_ptr)
 
    if ( buf_ptr == NULL )
    {
-      post_err_mssg("Can't allocate I/O buffer.");
       proceed = FALSE;
+
+      fprintf(stderr, "ERROR: Can't allocate I/O buffer.\n\n");
    }
 
    if ( proceed )
    {
       offset = vars_ptr->actual_chunk_start;
-      bytes_remaining = vars_ptr->actual_chunk_end - 
+      bytes_remaining = vars_ptr->actual_chunk_end -
                         vars_ptr->actual_chunk_start + 1;
    }
 
@@ -2617,10 +2454,10 @@ write_chunk(struct vc_vars * vars_ptr)
          offset += bytes_this_read;
       }
 
-      proceed = load_buf_from_file(offset_this_read, bytes_this_read, 
+      proceed = load_buf_from_file(offset_this_read, bytes_this_read,
                                    buf_ptr, vars_ptr);
 
-      if ( proceed ) 
+      if ( proceed )
          proceed = write_buf_to_output_fd(bytes_this_read, buf_ptr, vars_ptr);
    }
 
@@ -2631,7 +2468,7 @@ write_chunk(struct vc_vars * vars_ptr)
    {
       free(buf_ptr);
       buf_ptr = NULL;
-   } 
+   }
 
    return(proceed);
 
@@ -2643,8 +2480,6 @@ write_chunk(struct vc_vars * vars_ptr)
  *
  * Purpose:      main routine for vc (virtual chunker).
  *
- * Changes:      none.
- *
  *-------------------------------------------------------------------------
  */
 
@@ -2653,18 +2488,14 @@ main(int argc,
      char *argv[])
 {
    int proceed = TRUE;
-   struct vc_vars vars = 
+   struct vc_vars vars =
    {
-      /* magic               = */ VC_VARS_MAGIC,
-      /*                       */ 
+      /*                       */
       /* dry_run             = */ FALSE,
       /* chunk_len           = */ (unsigned long long)0,
-      /* chunk_index         = */ (unsigned long long)0,
-      /* max_chunk_index     = */ (unsigned long long)0,
+      /* chunk_index         = */ (unsigned long long)-1,
+      /* max_chunk_index     = */ (unsigned long long)-1,
       /* name_pattern        = */ np_none,
-      /* input_file_name     = */ "",
-      /* output_file_name    = */ "",
-      /* output_fifo_name    = */ "", 
       /* verbosity           = */ 0,
       /*                       */
       /* input_file_len      = */ (off_t)0,
@@ -2677,19 +2508,22 @@ main(int argc,
       /*                       */
       /* first_lines         = */ {NULL, NULL, NULL, NULL},
       /* last_lines          = */ {NULL, NULL, NULL, NULL},
-      /* first_lines_offsets = */ {(unsigned long long)0, 
+      /* first_lines_offsets = */ {(unsigned long long)0,
       /*                       */  (unsigned long long)0,
       /*                       */  (unsigned long long)0,
       /*                       */  (unsigned long long)0},
-      /* last_lines_offsets  = */ {(unsigned long long)0, 
+      /* last_lines_offsets  = */ {(unsigned long long)0,
       /*                       */  (unsigned long long)0,
       /*                       */  (unsigned long long)0,
-      /*                       */  (unsigned long long)0}
+      /*                       */  (unsigned long long)0},
+      /* input_file_name     = */ "",
+      /* output_file_name    = */ "",
+      /* output_fifo_name    = */ ""
    };
 
-   /* We will be working with large files (10's of GB), and thus 
+   /* We will be working with large files (10's of GB), and thus
     * we will be using the OS file system calls for I/O (open(),
-    * read(), lseek(), etc) instead of the file I/O calls in the 
+    * read(), lseek(), etc) instead of the file I/O calls in the
     * C library since they use off_t for offsets instead of longs.
     *
     * However, in some C library implementations, off_t is a 4 byte
@@ -2701,43 +2535,28 @@ main(int argc,
 
    if ( vars.verbosity >= 3 ) dump_params(&vars);
 
-   if ( proceed ) proceed = get_input_file_len(&vars);
-
-   if ( ( proceed ) && 
-        ( vars.chunk_len > (unsigned long long)(vars.input_file_len) ) )
-   {
-      post_err_mssg("chunk size greater than input file size.");
-      proceed = FALSE;
-   }
-
-   if ( ( proceed ) &&
-        ( ((vars.chunk_len * vars.max_chunk_index) + (5 * MAX_SEQUENCE_LEN))
-          >= vars.input_file_len ) )
-   {
-      post_err_mssg("Last chunk too small.  Decrease max chunk index?");
-      proceed = FALSE;
-   }
-
    if ( proceed ) proceed = open_input_file(&vars);
 
    if ( vars.dry_run ) /* compute all chunk end points, then exit */
    {
       if ( proceed ) proceed = dry_run(&vars);
+      if ( vars.input_fd != -1 )
+         close_input_file(&vars);
+      return(!proceed);
    }
-   else /* normal execution */
-   {
-      if ( proceed ) proceed = compute_nominal_chunk_endpoints(&vars);
 
-      if ( proceed ) proceed = compute_actual_chunk_start_point(&vars);
+   /* normal execution */
+   if ( proceed ) proceed = compute_nominal_chunk_endpoints(&vars);
 
-      if ( proceed ) proceed = compute_actual_chunk_end_point(&vars);
+   if ( proceed ) proceed = compute_actual_chunk_start_point(&vars);
 
-      if ( proceed ) proceed = setup_output_fd(&vars);
+   if ( proceed ) proceed = compute_actual_chunk_end_point(&vars);
 
-      if ( proceed ) proceed = write_chunk(&vars);
+   if ( proceed ) proceed = setup_output_fd(&vars);
 
-      if ( vars.output_fd != -1 ) takedown_output_fd(&vars);
-   }
+   if ( proceed ) proceed = write_chunk(&vars);
+
+   if ( vars.output_fd != -1 ) takedown_output_fd(&vars);
 
    if ( vars.input_fd != -1 ) close_input_file(&vars);
 
