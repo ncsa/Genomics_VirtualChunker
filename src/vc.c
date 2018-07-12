@@ -33,6 +33,18 @@
 
 #define IS_QUAL_CHAR(c) ( ( (int)(c) >= 33 ) && ( (int)(c) <= 126 ) )
 
+/*
+ * specify the pattern used to distinguish between the samples for
+ * the same trait on each half of a chromosone pair. <is that correct???>
+ * If those two samples are continguous in the input, then vc will
+ * avoid splitting the input into different chunks at that point.
+ */
+typedef enum name_pattern_kind {
+   np_none,
+   np_neat,	// neat
+   np_illumina	// illimina
+} name_pattern_kind;
+
 
 /* type definitions */
 
@@ -45,6 +57,7 @@ struct vc_vars
    unsigned long long chunk_len;
    unsigned long long chunk_index;
    unsigned long long max_chunk_index;
+   name_pattern_kind name_pattern;
    char input_file_name[MAX_PATH_LEN +1];
    char output_file_name[MAX_PATH_LEN +1];
    char output_fifo_name[MAX_PATH_LEN +1];
@@ -110,6 +123,7 @@ static int compute_actual_chunk_start_point(struct vc_vars * vars_ptr);
 static int compute_nominal_chunk_endpoints(struct vc_vars * vars_ptr);
 static void count_assignment_errors(int offset, struct line_header line_map[], 
                                     int line_count, int * err_count_ptr);
+static int name_match(struct vc_vars * vars_ptr, char *name1, char *name2);
 static int dry_run(struct vc_vars * vars_ptr);
 static void dry_run__dump_chunk_boundaries(
 			              struct dry_run_chunk_record * drc_array,
@@ -288,17 +302,36 @@ compute_actual_chunk_end_point(struct vc_vars * vars_ptr)
                dump_seq_map(map, seq_count);
             }
          } 
-         else /* we found our actual start point */
+         else
          {
             assert(i + 1 < seq_count);
 
-            vars_ptr->actual_chunk_end = map[i+1].offsets[0] - 1;
-
-            assert(vars_ptr->actual_chunk_end >= 
+            assert(map[i+1].offsets[0] - 1 >= 
                    vars_ptr->nominal_chunk_end);
-            assert(vars_ptr->actual_chunk_end < 
+            assert(map[i+1].offsets[0] - 1 < 
                    (vars_ptr->nominal_chunk_end + 
                     (off_t)(2 * MAX_SEQUENCE_LEN)));
+
+            if ( (i < seq_count) && (vars_ptr->name_pattern != np_none) ) {
+               /* check to see if breaking the chunks at this point would result
+                * in continguous similarly-named sequences being in different chunks.
+                * If so, then back up one sequence and break the file there.
+                */
+               if ( name_match(vars_ptr, map[i].lines[0], map[i + 1].lines[0]) )
+               {
+                  if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
+                  {
+                      fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
+                      fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i].lines[0], map[i + 1].lines[0]);
+                      fprintf(stdout, "Split at previous chunk instead.\n");
+                  }
+
+                  i--;
+               }
+            }
+
+            /* we found our actual end point */
+            vars_ptr->actual_chunk_end = map[i+1].offsets[0] - 1;
 
             if ( ( vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
             {
@@ -452,15 +485,34 @@ compute_actual_chunk_start_point(struct vc_vars * vars_ptr)
                dump_seq_map(map, seq_count);
             }
          } 
-         else /* we found our actual start point */
+         else
          {
-            vars_ptr->actual_chunk_start = map[i].offsets[0];
-
-            assert(vars_ptr->actual_chunk_start >= 
+            assert(map[i].offsets[0] >= 
                    vars_ptr->nominal_chunk_start);
-            assert(vars_ptr->actual_chunk_start < 
+            assert(map[i].offsets[0] < 
                    (vars_ptr->nominal_chunk_start + 
                     (off_t)(2 * MAX_SEQUENCE_LEN)));
+
+            if ( (i > 0) && (vars_ptr->name_pattern != np_none) ) {
+               /* check to see if breaking the chunks at this point would result
+                * in continguous similarly-named sequences being in different chunks.
+                * If so, then back up one sequence and break the file there.
+                */
+               if ( name_match(vars_ptr, map[i - 1].lines[0], map[i].lines[0]) )
+               {
+                  if ( ( ! vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
+                  {
+                      fprintf(stdout, "\nSplitting here would result in like-named sequences in different chunks.\n");
+                      fprintf(stdout, "\"%s\"\n\"%s\"\n", map[i - 1].lines[0], map[i].lines[0]);
+                      fprintf(stdout, "Split at previous chunk instead.\n");
+                  }
+
+                  i--;
+               }
+            }
+
+            /* we found our actual start point */
+            vars_ptr->actual_chunk_start = map[i].offsets[0];
 
             if ( ( vars_ptr->dry_run ) && ( vars_ptr->verbosity >= 2 ) )
             {
@@ -707,6 +759,54 @@ count_assignment_errors(int offset,
    return;
 
 } /* count_assignment_errors() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    name_match()
+ *
+ * Purpose:	compare the names of two sequences to see if they are
+ *              corresponding bases on a chromosone pair, according to
+ *              the convention specified with the -n option.
+ *
+ * Return:      TRUE if the names match, FALSE if not
+ *
+ * Changes:	TO DO: do a more flexible pattern match rather than
+ *              searching for a single character delimiter in the name.
+ *
+ *-------------------------------------------------------------------------
+ */
+static int name_match(struct vc_vars * vars_ptr, char *name1, char *name2)
+{
+   if ( vars_ptr->name_pattern == np_none ) {
+      return TRUE;
+   }
+   else if ( vars_ptr->name_pattern == np_neat ) {
+      /*
+       * Return TRUE if the names match up to the "/" character.
+       */
+      char *cp = strchr(name1, '/');
+      int len = (cp != NULL) ?  (cp - name1) : strlen(name1);
+      if (( strncmp(name1, name2, len) == 0)
+        && (name2[len] == '/') ) {
+         return TRUE;
+      }
+   }
+   else if ( vars_ptr->name_pattern == np_illumina ) {
+      /*
+       * Return TRUE if the names match up to the space character.
+       */
+      char *cp = strchr(name1, ' ');
+      int len = (cp != NULL) ?  (cp - name1) : strlen(name1);
+      if (( strncmp(name1, name2, len) == 0)
+        && (name2[len] == ' ') ) {
+         return TRUE;
+      }
+   }
+   else {
+      assert(("unrecognized name pattern kind", 0));
+   }
+   return FALSE;
+}
 
 
 /*-------------------------------------------------------------------------
@@ -972,6 +1072,7 @@ dump_params(struct vc_vars * vars_ptr)
    fprintf(stdout, "   chunk_len        = %llu\n", vars_ptr->chunk_len);
    fprintf(stdout, "   chunk_index      = %llu\n", vars_ptr->chunk_index);
    fprintf(stdout, "   max_chunk_index  = %llu\n", vars_ptr->max_chunk_index);
+   fprintf(stdout, "   name_pattern     = %d\n\n", vars_ptr->name_pattern);
    fprintf(stdout, "   input_file_name  = \"%s\"\n", 
            vars_ptr->input_file_name);
    fprintf(stdout, "   output_file_name = \"%s\"\n", 
@@ -1160,7 +1261,7 @@ get_params(int argc,
    }
 
    while ( ( proceed ) &&
-           ( (opt = getopt(argc, argv, "ds:i:m:f:p:v?")) != -1 ) )
+           ( (opt = getopt(argc, argv, "ds:i:m:n:f:p:v?")) != -1 ) )
    {
       switch ( opt ) 
       {
@@ -1282,6 +1383,22 @@ get_params(int argc,
             vars_ptr->max_chunk_index = strtoull(optarg, NULL, 10);
             assert(errno == 0);
             have_max_chunk_index = TRUE;
+            break;
+
+         case 'n':
+            assert(optarg != NULL);
+            if ( (strcmp(optarg, "neat") == 0 )
+              || (strcmp(optarg, "/") == 0) ) {
+                vars_ptr->name_pattern = np_neat;
+            }
+            else if ( (strcmp(optarg, "illumina") == 0 )
+              || (strcmp(optarg, " ") == 0) ) {
+                vars_ptr->name_pattern = np_illumina;
+            }
+            else {
+               proceed = FALSE;
+            }
+            errno = 0;
             break;
 
          case 'f':
@@ -1706,7 +1823,7 @@ map_test_buf(off_t test_buf_offset,
             map[j].offsets[3]  = line_map[i + 3].offset;
             map[j].lines[3]    = line_map[i + 3].line_ptr;
             map[j].line_len[3] = line_map[i + 3].line_len;
-            map[j].flags[2]    = line_map[i + 3].id_flags;
+            map[j].flags[3]    = line_map[i + 3].id_flags;
 
             j++;
          }
@@ -2322,6 +2439,22 @@ usage: vc [OPTIONS] <input FASTQ file>\n\
 \n\
       -m n               Max chunk index. \n\
 \n\
+      -n <patt>          Check chunk boundaries. Do not split chunks\n\
+                         between two sequences which have similar names.\n\
+                         \"Similar\" means that the names are identical\n\
+                         according to the pattern <patt>.  <patt> must \n\
+                         be one of ihe following\n\
+                         \n\
+                         \n\
+                         \n\
+                         \n\
+                         \n\
+                         \n\
+                         This only works if the sequences are in pairs,\n\
+                         appearing consecutively in the input.  It does\n\
+                         work with groups of three or more similarly-named\n\
+                         sequences.\n\
+\n\
       -f <file name>     Name of the file to which to write the chunk.\n\
 \n\
       -p <FIFO name>     Name of the FIFO (AKA named pipe) to which to  \n\
@@ -2528,6 +2661,7 @@ main(int argc,
       /* chunk_len           = */ (unsigned long long)0,
       /* chunk_index         = */ (unsigned long long)0,
       /* max_chunk_index     = */ (unsigned long long)0,
+      /* name_pattern        = */ np_none,
       /* input_file_name     = */ "",
       /* output_file_name    = */ "",
       /* output_fifo_name    = */ "", 
